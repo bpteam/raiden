@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Auto Splitter — A1 Mini</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#2c3038; --text:#e6e8ec; --muted:#9097a3; --accent:#4fb3ff; --ok:#5fd18a; --bad:#ff6b6b; --warn:#ffc35a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--text); display:grid; grid-template-columns:340px 1fr; height:100vh; }
+  aside { background:var(--panel); border-right:1px solid var(--line); padding:14px; overflow:auto; }
+  main { position:relative; }
+  #view { position:absolute; inset:0; }
+  h1 { font-size:15px; margin:0 0 2px; } .sub { color:var(--muted); margin-bottom:12px; }
+  label { display:block; color:var(--muted); margin:10px 0 4px; }
+  select, input, button { font:inherit; color:var(--text); background:#262a31; border:1px solid var(--line); border-radius:6px; padding:6px 8px; width:100%; }
+  button { cursor:pointer; } button.primary { background:var(--accent); color:#06121d; border:none; font-weight:600; margin-top:12px; }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:6px; } .row > * { flex:1; }
+  .tabs { position:absolute; top:10px; left:10px; display:flex; gap:4px; z-index:2; }
+  .tabs button { width:auto; } .tabs button.on { background:var(--accent); color:#06121d; }
+  #sliderBox { position:absolute; bottom:12px; left:50%; transform:translateX(-50%); width:min(420px, 80%); z-index:2; background:#1d2026cc; padding:6px 10px; border-radius:8px; }
+  .bar { height:6px; background:#262a31; border-radius:3px; overflow:hidden; margin-top:6px; } .bar > div { height:100%; background:var(--accent); width:0; }
+  section { border-top:1px solid var(--line); margin-top:12px; padding-top:8px; }
+  .k { color:var(--muted); } .pass { color:var(--ok); } .fail { color:var(--bad); } .warn { color:var(--warn); }
+  ul { padding-left:16px; margin:4px 0; } li { margin:2px 0; }
+  .sw { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+  a { color:var(--accent); }
+  @media (max-width: 760px) { body { grid-template-columns:1fr; grid-template-rows:auto 60vh; } aside { order:2; } }
+</style>
+</head>
+<body>
+<aside>
+  <h1>Auto Splitter</h1>
+  <div class="sub">Bambu Lab A1 Mini · 180×180×180 mm · 0.4 mm nozzle · runs fully in your browser</div>
+  <label>Sample model (bundled locally)</label>
+  <select id="sample"></select>
+  <label>…or your file (STL, 3MF, OBJ, GLB/GLTF)</label>
+  <input type="file" id="file" accept=".stl,.3mf,.obj,.glb,.gltf" />
+  <label>Target model height, mm (Z after import)</label>
+  <input type="number" id="height" value="150" min="5" max="2000" />
+  <div class="row"><button class="primary" id="go" disabled>Auto Prepare</button><button id="cancel" disabled style="margin-top:12px">Cancel</button></div>
+  <div id="stage" class="k" style="margin-top:8px">Pick a model.</div>
+  <div class="bar"><div id="bar"></div></div>
+  <div id="out"></div>
+</aside>
+<main>
+  <div class="tabs" id="tabs"></div>
+  <div id="view"></div>
+  <div id="sliderBox" hidden><span class="k">Assembled ↔ Exploded</span><input type="range" id="explode" min="0" max="1" step="0.01" value="0.6" /></div>
+</main>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>
