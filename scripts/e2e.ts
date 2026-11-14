@@ -19,10 +19,13 @@ const t0 = Date.now();
 const r = prepare(w, solid!, scale, 12, (s, f) => process.stdout.write(`\r${(f * 100).toFixed(0)}% ${s}            `));
 console.log(`\nprepare ${Date.now() - t0} ms\n${r.decision}`);
 console.log(r.checks, r.warnings);
-for (const c of r.cuts) console.log(`cut ${c.id} n=${c.normal.map((v) => v.toFixed(2))} seam ${c.seamLength.toFixed(0)} mm, hidden ${(c.hidden * 100).toFixed(0)}%, islands ${c.islands}, pins ${c.pins.map((p) => `${p.shape}⌀${(2 * p.r).toFixed(1)}x${(2 * p.depth).toFixed(0)}`).join(' ')}`);
-for (const p of r.parts) console.log(p.name, p.role, 'faces', p.cutFaces.length, 'plate', p.plate + 1, 'h', p.height.toFixed(1), 'support mm²', p.supportArea.toFixed(0), 'contact', p.bedContact.toFixed(0));
+for (const c of r.cuts) console.log(`cut ${c.id} n=${c.normal.map((v) => v.toFixed(2))} h=${c.offset.toFixed(1)} seam ${c.seamLength.toFixed(0)} mm, visible-weighted ${c.visibleSeam.toFixed(0)} mm, neck ${c.neck.toFixed(2)}, islands ${c.islands}, pins ${c.pins.map((p) => `${p.shape}⌀${(2 * p.r).toFixed(1)}x${(2 * p.depth).toFixed(0)}`).join(' ')}`);
+for (const p of r.parts) console.log(p.name, p.role, 'faces', p.cutFaces.length, 'plate', p.plate + 1, 'h', p.height.toFixed(1), 'support mm²', p.supportArea.toFixed(0), 'on visible', (p.metrics?.supportVisible ?? 0).toFixed(0), 'contact', p.bedContact.toFixed(0), 'down', p.metrics?.down.map((v) => v.toFixed(2)).join(','));
+console.log('summary', JSON.stringify(r.summary));
+console.log('alternatives', JSON.stringify(r.alternatives));
+mkdirSync(`${process.env.OUT ?? 'out'}/${basename(file)}`, { recursive: true });
 const out = `${process.env.OUT ?? 'out'}/${basename(file)}`;
-mkdirSync(out, { recursive: true });
+writeFileSync(`${process.env.OUT ?? 'out'}/${basename(file)}.summary.json`, JSON.stringify({ decision: r.decision, summary: r.summary, checks: r.checks, warnings: r.warnings, alternatives: r.alternatives, cuts: r.cuts.map((c) => ({ ...c, pins: c.pins.length })), parts: r.parts.map((p) => ({ name: p.name, role: p.role, plate: p.plate, height: p.height, volume: p.volume, metrics: p.metrics })) }, null, 1));
 const files = exportAll(r);
 for (const [name, data] of Object.entries(files)) writeFileSync(`${out}/${name}`, data);
 // Re-import every export and verify it is a closed solid with the same volume.
@@ -30,7 +33,9 @@ let fail = 0;
 for (const [name, data] of Object.entries(files)) {
   const s = await importModel(name, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer);
   const re = toManifold(w, s.pos);
-  const expect = name.endsWith('.stl') ? r.parts.find((p) => `${p.name}.stl` === name)!.volume : r.parts.filter((p) => `plate_${p.plate + 1}.3mf` === name).reduce((a, p) => a + p.volume, 0);
+  const expect = name.endsWith('.stl') ? r.parts.find((p) => `${p.name}.stl` === name)!.volume
+    : name.startsWith('project') ? r.parts.filter((p) => p.plate >= 0).reduce((a, p) => a + p.volume, 0)
+    : r.parts.filter((p) => `plate_${p.plate + 1}.3mf` === name).reduce((a, p) => a + p.volume, 0);
   const ok = re.report.ok && Math.abs(re.report.volume - expect) / expect < 1e-3;
   if (!ok) fail++;
   console.log('reimport', name, ok ? 'OK' : 'FAIL', re.report.volume.toFixed(1), expect.toFixed(1));
