@@ -11,6 +11,7 @@ import { render, visibleAt, sphereDirs, type Tris } from './raster';
 
 export interface Field {
   n: number; cx: Float32Array; nrm: Float32Array; V: Float32Array; D: Float32Array; C: Float32Array;
+  W: Float32Array; // user seam bias (Guided Split): 1 = neutral, <1 = "seam here" hint, ≫1 = no-cut zone
   cell: number; grid: Map<number, number[]>;
   memo: Map<number, number>; // quantised triangle centroid → lookup result (cut pieces share most triangles with their parent)
 }
@@ -115,7 +116,7 @@ export function analyzeSurface(m: Manifold): Field {
   }
   const sgrid = new Map<number, number[]>();
   for (let j = 0; j < ns; j++) { const k = key(Math.floor(scx[j * 3] / cell), Math.floor(scx[j * 3 + 1] / cell), Math.floor(scx[j * 3 + 2] / cell)); let l = sgrid.get(k); if (!l) sgrid.set(k, (l = [])); l.push(j); }
-  return { n: ns, cx: scx, nrm: snrm, V: sV, D: sD, C: sC, cell, grid: sgrid, memo: new Map() };
+  return { n: ns, cx: scx, nrm: snrm, V: sV, D: sD, C: sC, W: new Float32Array(ns).fill(1), cell, grid: sgrid, memo: new Map() };
 }
 
 /** Field values at a surface point with normal nr, or null when no original surface is nearby (new internal surface: cut cap, hole). */
@@ -140,13 +141,13 @@ export function lookup(f: Field, p: ArrayLike<number>, nr: ArrayLike<number>, to
 /** A part's triangles with surface attributes. iface = 1 on cut caps / joint holes (hidden after assembly). */
 export interface PartMesh extends Tris {
   nt: number; cx: Float32Array; nrm: Float32Array; area: Float32Array;
-  V: Float32Array; D: Float32Array; C: Float32Array; iface: Uint8Array;
+  V: Float32Array; D: Float32Array; C: Float32Array; W: Float32Array; iface: Uint8Array;
 }
 
 export function partMesh(m: Manifold, f: Field, planes: { normal: number[]; offset: number }[], tol = 2): PartMesh {
   const t = meshOf(m);
   const g = triGeom(t);
-  const V = new Float32Array(g.nt), D = new Float32Array(g.nt), C = new Float32Array(g.nt), iface = new Uint8Array(g.nt);
+  const V = new Float32Array(g.nt), D = new Float32Array(g.nt), C = new Float32Array(g.nt), W = new Float32Array(g.nt).fill(1), iface = new Uint8Array(g.nt);
   const { cx, nrm } = g;
   const p = [0, 0, 0], nr = [0, 0, 0];
   for (let i = 0; i < g.nt; i++) {
@@ -163,7 +164,7 @@ export function partMesh(m: Manifold, f: Field, planes: { normal: number[]; offs
     let j = f.memo.get(k);
     if (j === undefined) { j = lookup(f, p, nr, tol); f.memo.set(k, j); }
     if (j < 0) { iface[i] = 1; continue; }
-    V[i] = f.V[j]; D[i] = f.D[j]; C[i] = f.C[j];
+    V[i] = f.V[j]; D[i] = f.D[j]; C[i] = f.C[j]; W[i] = f.W[j];
   }
-  return { ...t, ...g, V, D, C, iface };
+  return { ...t, ...g, V, D, C, W, iface };
 }

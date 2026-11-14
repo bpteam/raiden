@@ -6,7 +6,9 @@ import { loadManifold, toManifold } from '../src/core/geom';
 import { prepare } from '../src/core/prepare';
 import { exportAll } from '../src/core/exporters';
 
-const [file, heightArg] = process.argv.slice(2);
+const [file, heightArg, hintsArg] = process.argv.slice(2);
+// optional: hints JSON file (Guided Split, model coordinates); env MIN_PARTS / PICK for Target Parts / proposal choice
+const hints = hintsArg ? JSON.parse(readFileSync(hintsArg, 'utf8')) : undefined;
 const w = await loadManifold();
 const b = readFileSync(file);
 const soup = await importModel(file, b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
@@ -16,16 +18,17 @@ if (!solid) { console.log('RESULT: not printable (no solid), diagnosed'); proces
 const bb = solid!.boundingBox();
 const scale = +(heightArg ?? 150) / (bb.max[2] - bb.min[2]);
 const t0 = Date.now();
-const r = prepare(w, solid!, scale, 12, (s, f) => process.stdout.write(`\r${(f * 100).toFixed(0)}% ${s}            `));
+const r = prepare(w, solid!, scale, 12, (s, f) => process.stdout.write(`\r${(f * 100).toFixed(0)}% ${s}            `), { hints, minParts: process.env.MIN_PARTS ? +process.env.MIN_PARTS : undefined, pick: process.env.PICK ? +process.env.PICK : undefined });
 console.log(`\nprepare ${Date.now() - t0} ms\n${r.decision}`);
 console.log(r.checks, r.warnings);
 for (const c of r.cuts) console.log(`cut ${c.id} n=${c.normal.map((v) => v.toFixed(2))} h=${c.offset.toFixed(1)} seam ${c.seamLength.toFixed(0)} mm, visible-weighted ${c.visibleSeam.toFixed(0)} mm, neck ${c.neck.toFixed(2)}, islands ${c.islands}, pins ${c.pins.map((p) => `${p.shape}⌀${(2 * p.r).toFixed(1)}x${(2 * p.depth).toFixed(0)}`).join(' ')}`);
 for (const p of r.parts) console.log(p.name, p.role, 'faces', p.cutFaces.length, 'plate', p.plate + 1, 'h', p.height.toFixed(1), 'support mm²', p.supportArea.toFixed(0), 'on visible', (p.metrics?.supportVisible ?? 0).toFixed(0), 'contact', p.bedContact.toFixed(0), 'down', p.metrics?.down.map((v) => v.toFixed(2)).join(','));
 console.log('summary', JSON.stringify(r.summary));
 console.log('alternatives', JSON.stringify(r.alternatives));
+console.log('proposals', JSON.stringify(r.proposals.map((p) => ({ ...p, loops: p.loops.length }))), 'picked', r.picked, 'ready', r.ready);
 mkdirSync(`${process.env.OUT ?? 'out'}/${basename(file)}`, { recursive: true });
 const out = `${process.env.OUT ?? 'out'}/${basename(file)}`;
-writeFileSync(`${process.env.OUT ?? 'out'}/${basename(file)}.summary.json`, JSON.stringify({ decision: r.decision, summary: r.summary, checks: r.checks, warnings: r.warnings, alternatives: r.alternatives, cuts: r.cuts.map((c) => ({ ...c, pins: c.pins.length })), parts: r.parts.map((p) => ({ name: p.name, role: p.role, plate: p.plate, height: p.height, volume: p.volume, metrics: p.metrics })) }, null, 1));
+writeFileSync(`${process.env.OUT ?? 'out'}/${basename(file)}.summary.json`, JSON.stringify({ ready: r.ready, proposals: r.proposals, decision: r.decision, summary: r.summary, checks: r.checks, warnings: r.warnings, alternatives: r.alternatives, cuts: r.cuts.map((c) => ({ ...c, pins: c.pins.length })), parts: r.parts.map((p) => ({ name: p.name, role: p.role, plate: p.plate, height: p.height, volume: p.volume, metrics: p.metrics })) }, null, 1));
 const files = exportAll(r);
 for (const [name, data] of Object.entries(files)) writeFileSync(`${out}/${name}`, data);
 // Re-import every export and verify it is a closed solid with the same volume.

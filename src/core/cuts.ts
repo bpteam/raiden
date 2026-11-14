@@ -9,7 +9,7 @@ export interface PlaneCand { n: number[]; h: number; seam: number; perim: number
 
 /** Seam weight per mm of seam on triangle i. A 0.15 floor keeps fully hidden seams from being totally free (assembly gap, glue). */
 export const seamWeight = (pm: PartMesh, i: number) =>
-  pm.iface[i] ? 0 : 0.15 + pm.V[i] * (1 + 0.5 * pm.D[i]) * (1 - 0.6 * Math.max(0, pm.C[i]));
+  pm.iface[i] ? 0 : (0.15 + pm.V[i] * (1 + 0.5 * pm.D[i]) * (1 - 0.6 * Math.max(0, pm.C[i]))) * pm.W[i];
 
 // Hemisphere of plane normals (± give the same plane family).
 const DIRS = sphereDirs(64).filter((d) => d[2] > 0 || (d[2] === 0 && d[1] >= 0));
@@ -139,4 +139,48 @@ export function seamFromCaps(pm: PartMesh, planes: { normal: number[]; offset: n
     raw += L; weighted += L * seamWeight(pm, surf); seamTri[surf] = 1;
   }
   return { raw, weighted, seamTri };
+}
+
+/** Score one given plane on a part (user stroke, contact face, hint direction): seam/perimeter of the nearest profile bin. */
+export function planeCand(pm: PartMesh, n: number[], h: number): PlaneCand | null {
+  const p = seamProfile(pm, n, 1.5);
+  const j = Math.round((h - p.lo) / p.st);
+  if (j < 1 || j >= p.bins || p.perim[j] <= 0) return null;
+  const balance = Math.min(p.frac[j], 1 - p.frac[j]);
+  return { n, h, seam: p.seam[j], perim: p.perim[j], neck: 0, score: 3 * p.seam[j], balance };
+}
+
+/**
+ * Planes that put a brushed group of surface points (Guided Split "this is its own part") entirely on the +n side:
+ * directions around (group centroid − part centroid), offsets below the group, best seam scores first.
+ */
+export function hintPlanes(pm: PartMesh, pts: number[][], k: number): PlaneCand[] {
+  if (!pts.length) return [];
+  let sa = 0; const pc = [0, 0, 0];
+  for (let i = 0; i < pm.nt; i++) { sa += pm.area[i]; for (let q = 0; q < 3; q++) pc[q] += pm.area[i] * pm.cx[i * 3 + q]; }
+  const gc = [0, 1, 2].map((q) => pts.reduce((s, p) => s + p[q], 0) / pts.length);
+  const d0 = gc.map((v, q) => v - pc[q] / (sa || 1)); const l0 = Math.hypot(...d0);
+  if (l0 < 1e-6) return [];
+  const n0 = d0.map((v) => v / l0);
+  const dirs = [n0, ...sphereDirs(64).flatMap((d) => [d, d.map((x) => -x)]).filter((d) => d[0] * n0[0] + d[1] * n0[1] + d[2] * n0[2] > 0.8)];
+  const out: PlaneCand[] = [];
+  for (const n of dirs) {
+    const p = seamProfile(pm, n, 1.5);
+    const proj = pts.map((q) => q[0] * n[0] + q[1] * n[1] + q[2] * n[2]);
+    const top = Math.min(...proj) - 1, floor = top - Math.max(25, 1.2 * (Math.max(...proj) - top)); // seam just below the brushed area, not far down the body
+    const win = Math.max(3, Math.round(p.bins * 0.12));
+    for (let j = 1; j < p.bins; j++) {
+      const h = p.lo + j * p.st;
+      if (h > top || h < floor || p.perim[j] <= 0 || p.frac[j] < 0.4) continue; // group above, and the group's side is not the bulk of the surface
+      let lmax = 0, rmax = 0;
+      for (let q = Math.max(0, j - win); q < j; q++) lmax = Math.max(lmax, p.perim[q]);
+      for (let q = j + 1; q <= Math.min(p.bins, j + win); q++) rmax = Math.max(rmax, p.perim[q]);
+      const side = Math.min(lmax, rmax), neck = side > 0 ? Math.max(0, 1 - p.perim[j] / side) : 0;
+      out.push({ n, h, seam: p.seam[j], perim: p.perim[j], neck, score: 3 * p.seam[j] * (1 - 0.5 * neck), balance: Math.min(p.frac[j], 1 - p.frac[j]) });
+    }
+  }
+  out.sort((a, b) => a.score - b.score);
+  const pick: PlaneCand[] = [];
+  for (const c of out) { if (pick.length >= k) break; if (!pick.some((q) => q.n[0] * c.n[0] + q.n[1] * c.n[1] + q.n[2] * c.n[2] > 0.97 && Math.abs(q.h - c.h) < 6)) pick.push(c); }
+  return pick;
 }

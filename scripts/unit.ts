@@ -6,7 +6,8 @@ import { planJoints } from '../src/core/joints';
 import { analyzeSurface, partMesh, evenOut } from '../src/core/analysis';
 import { candidatePlanes } from '../src/core/cuts';
 import { bestOrient } from '../src/core/orient';
-import { makePart, search } from '../src/core/search';
+import { makePart, search, mergeStrays } from '../src/core/search';
+import { strokePlane } from '../src/core/hints';
 import { pack } from '../src/core/pack';
 
 const w = await loadManifold();
@@ -79,5 +80,27 @@ const hull = (m: InstanceType<typeof Manifold>) => { const g = m.hull().getMesh(
   assert.equal(planJoints(w, thin.slice(50), thin, new Matrix4(), 50).length, 0, 'too-thin island gets no dowel (reported as glue-only)');
   const flat = Manifold.cube([60, 60, 8], true);
   for (const p of planJoints(w, flat.slice(0), flat, new Matrix4(), 0)) assert.ok(p.depth <= 4, `shallow part shrinks hole depth (got ${p.depth})`);
+}
+// --- stray fragments: a chin lobe that dips below a neck plane goes back to the head, a cut-off hand stays cut
+{
+  const head = Manifold.sphere(20, 64).translate([0, 0, 40]).add(Manifold.sphere(6, 32).translate([0, 12, 22])); // chin lobe reaches z≈16
+  const torso = Manifold.cube([30, 30, 20], true).translate([0, -25, 10]);
+  const body = head.add(Manifold.cylinder(30, 6, 6, 32).translate([0, 0, 0])).add(torso);
+  const [up, dn] = body.splitByPlane([0, 0, 1], 19);
+  const pieces = [...up.decompose().map((m) => ({ m, side: 1 })), ...dn.decompose().map((m) => ({ m, side: -1 }))];
+  assert.ok(pieces.length >= 3, `plane leaves a separate chin piece (pieces ${pieces.length})`);
+  const r = mergeStrays(pieces);
+  assert.equal(r.pieces.length, 2, 'chin re-attached: exactly head + body remain');
+  const hand = Manifold.cube([10, 10, 40], true).translate([0, 0, 20]);
+  const [a, b] = hand.splitByPlane([0, 0, 1], 30);
+  assert.equal(mergeStrays([{ m: a, side: 1 }, { m: b, side: -1 }]).pieces.length, 2, 'a lone small piece (hand) is never merged back');
+}
+
+// --- rough seam stroke: noisy ring around z=5 gives the plane z=5; a straight line gives none
+{
+  const ring = Array.from({ length: 24 }, (_, i) => [10 * Math.cos(i / 4), 10 * Math.sin(i / 4), 5 + 0.3 * Math.sin(i * 7)]);
+  const pl = strokePlane(ring)!;
+  assert.ok(pl && pl.n[2] > 0.98 && Math.abs(pl.h - 5) < 0.5, `stroke plane z≈5 (n=${pl?.n.map((x) => x.toFixed(2))}, h=${pl?.h.toFixed(2)})`);
+  assert.equal(strokePlane([[0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3]]), null, 'collinear stroke defines no plane');
 }
 console.log('unit: all checks passed');

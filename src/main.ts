@@ -65,7 +65,7 @@ function frame(obj: THREE.Object3D) {
 const clear = () => { for (const c of [...root.children]) { root.remove(c); c.traverse((o) => { if (o instanceof THREE.Mesh) { o.geometry.dispose(); } }); } };
 
 // ---------- state ----------
-type View = 'Original' | 'Assembled' | 'Exploded' | 'Print Plates';
+type View = 'Original' | 'Cut lines' | 'Assembled' | 'Exploded' | 'Print Plates';
 let original: Float32Array | null = null;
 let result: any = null;
 let view: View = 'Original';
@@ -73,7 +73,7 @@ let current: { name: string; buf: ArrayBuffer } | null = null;
 let worker: Worker | null = null;
 const tabs = $('tabs');
 function renderTabs() {
-  const avail: View[] = result ? ['Original', 'Assembled', 'Exploded', 'Print Plates'] : ['Original'];
+  const avail: View[] = result ? ['Original', 'Cut lines', 'Assembled', 'Exploded', 'Print Plates'] : ['Original'];
   tabs.innerHTML = '';
   for (const v of avail) {
     const b = document.createElement('button');
@@ -89,8 +89,19 @@ function draw(refit = false) {
   renderTabs();
   clear();
   $('sliderBox').hidden = view !== 'Exploded';
-  if (view === 'Original' && original) root.add(meshOf(original, 0xb8c0cc));
-  if (result && view !== 'Original') {
+  if ((view === 'Original' || view === 'Cut lines') && original) {
+    const om = meshOf(original, 0xb8c0cc); om.name = 'original'; root.add(om);
+    root.add(hintPoints());
+    if (view === 'Cut lines' && result) result.meta.proposals.forEach((pr: any, k: number) => {
+      const on = k === result.meta.picked;
+      for (const loop of pr.loops) {
+        const g = new THREE.BufferGeometry().setFromPoints([...loop, loop[0]].map((p: number[]) => new THREE.Vector3(...p)));
+        const l = new THREE.Line(g, new THREE.LineBasicMaterial({ color: on ? 0xff3b5c : PROP_COLORS[k % 3], depthTest: false, transparent: true, opacity: on ? 1 : 0.55 }));
+        l.renderOrder = 10; root.add(l);
+      }
+    });
+  }
+  if (result && view !== 'Original' && view !== 'Cut lines') {
     const k = +$<HTMLInputElement>('explode').value;
     if (view === 'Print Plates') {
       const n = result.meta.plates;
@@ -147,6 +158,67 @@ function draw(refit = false) {
 }
 $<HTMLInputElement>('explode').oninput = () => draw();
 
+// ---------- Guided Split: brush intent onto the surface (raycast, stored in model coordinates) ----------
+const PROP_COLORS = [0xffd166, 0x06d6a0, 0x9b8cff];
+type Brush = 'part' | 'seam' | 'nocut' | 'erase' | null;
+let brush: Brush = null, group = 0, painting = false;
+const hints = { parts: [[]] as number[][][], seams: [] as number[][][], noCut: [] as number[][] };
+const GROUP_COLORS = [0x4fb3ff, 0x5fd18a, 0xc77dff, 0xff9f43, 0xf6e05e, 0x48dbfb];
+function hintPoints() {
+  const pts: number[] = [], col: number[] = [];
+  const add = (p: number[], c: number) => { pts.push(...p); const k = new THREE.Color(c); col.push(k.r, k.g, k.b); };
+  hints.parts.forEach((g, i) => g.forEach((p) => add(p, GROUP_COLORS[i % GROUP_COLORS.length])));
+  hints.seams.flat().forEach((p) => add(p, 0xffffff));
+  hints.noCut.forEach((p) => add(p, 0xff3030));
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  const m = new THREE.Points(g, new THREE.PointsMaterial({ size: 7, sizeAttenuation: false, vertexColors: true, depthTest: false }));
+  m.renderOrder = 11; return m;
+}
+const spacing = () => { const b = new THREE.Box3().setFromObject(root.getObjectByName('original')!); return b.getSize(new THREE.Vector3()).length() / 160; };
+function hintChanged() {
+  const n = hints.parts.filter((g) => g.length).length;
+  $('hintInfo').textContent = `${n} part group(s) (current: #${group + 1}), ${hints.seams.length} seam stroke(s), ${hints.noCut.length} no-cut point(s). Hints are in model coordinates; they stay put when you rotate.`;
+  if (result) { result = null; view = 'Original'; $('out').innerHTML = '<section class="warn">Hints changed: previous cuts, plates and export discarded. Press Find Best Cuts again.</section>'; }
+  draw();
+}
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+function hit(e: PointerEvent): number[] | null {
+  const o = root.getObjectByName('original'); if (!o || !renderer) return null;
+  const r = renderer.domElement.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const h = ray.intersectObject(o)[0];
+  return h ? h.point.toArray() : null;
+}
+function paint(p: number[]) {
+  const d = spacing(), far = (arr: number[][]) => arr.every((q) => Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]) > d);
+  if (brush === 'part') { if (far(hints.parts[group])) hints.parts[group].push(p); }
+  else if (brush === 'seam') { const s = hints.seams[hints.seams.length - 1]; if (far(s)) s.push(p); }
+  else if (brush === 'nocut') { if (far(hints.noCut)) hints.noCut.push(p); }
+  else if (brush === 'erase') {
+    const keep = (q: number[]) => Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]) > d * 5;
+    hints.parts = hints.parts.map((g) => g.filter(keep)); hints.seams = hints.seams.map((g) => g.filter(keep)).filter((g) => g.length); hints.noCut = hints.noCut.filter(keep);
+  }
+}
+renderer?.domElement.addEventListener('pointerdown', (e) => {
+  if (!brush || e.button !== 0 || (view !== 'Original' && view !== 'Cut lines')) return;
+  const p = hit(e); if (!p) return; // off the model: orbit as usual
+  painting = true; controls.enabled = false;
+  if (brush === 'seam') hints.seams.push([]);
+  paint(p); draw();
+});
+renderer?.domElement.addEventListener('pointermove', (e) => { if (!painting) return; const p = hit(e); if (p) { paint(p); draw(); } });
+addEventListener('pointerup', () => { if (!painting) return; painting = false; controls.enabled = true; hints.seams = hints.seams.filter((g) => g.length); hintChanged(); });
+document.querySelectorAll<HTMLButtonElement>('#brushes button').forEach((b) => (b.onclick = () => {
+  brush = brush === b.dataset.b ? null : (b.dataset.b as Brush);
+  document.querySelectorAll('#brushes button').forEach((x) => x.classList.toggle('on', (x as HTMLElement).dataset.b === brush));
+}));
+$('newGroup').onclick = () => { if (hints.parts[group].length) { hints.parts.push([]); group = hints.parts.length - 1; } brush = 'part'; document.querySelectorAll('#brushes button').forEach((x) => x.classList.toggle('on', (x as HTMLElement).dataset.b === 'part')); hintChanged(); };
+$('clearHints').onclick = () => { hints.parts = [[]]; hints.seams = []; hints.noCut = []; group = 0; hintChanged(); };
+const modeSel = $<HTMLSelectElement>('mode');
+modeSel.onchange = () => { const g = modeSel.value === 'guided'; $('guided').hidden = !g; $('go').textContent = g ? 'Find Best Cuts' : 'Auto Prepare'; if (!g) { brush = null; document.querySelectorAll('#brushes button').forEach((x) => x.classList.remove('on')); } };
+
 // ---------- worker plumbing ----------
 function startWorker(msg: any, onDone: (d: any) => void) {
   worker?.terminate();
@@ -171,6 +243,7 @@ const esc = (s: string) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt
 
 function load(name: string, buf: ArrayBuffer) {
   current = { name, buf }; result = null; original = null; view = 'Original'; $('out').innerHTML = '';
+  hints.parts = [[]]; hints.seams = []; hints.noCut = []; group = 0;
   startWorker({ type: 'import', name, buf }, (d) => {
     original = d.soup;
     const r = d.report, b = r.bbox;
@@ -198,11 +271,14 @@ $<HTMLInputElement>('file').onchange = async (e) => {
   if (f) { sel.value = ''; load(f.name, await f.arrayBuffer()); }
 };
 
-$('go').onclick = () => {
+$('go').onclick = () => run(0);
+function run(pick: number) {
   if (!current) return;
   const height = +$<HTMLInputElement>('height').value;
   if (!(height > 0)) { $('stage').textContent = 'Enter a positive height.'; return; }
-  startWorker({ type: 'run', ...current, height }, (d) => {
+  const guided = modeSel.value === 'guided';
+  const minParts = +$<HTMLInputElement>('minParts').value || undefined, maxParts = +$<HTMLInputElement>('maxParts').value || 12;
+  startWorker({ type: 'run', ...current, height, minParts, maxParts, pick, hints: guided ? { parts: hints.parts.filter((g) => g.length), seams: hints.seams, noCut: hints.noCut } : undefined }, (d) => {
     result = d; view = d.parts.length > 1 ? 'Exploded' : 'Assembled';
     $('stage').textContent = 'Done.';
     const m = d.meta;
@@ -210,7 +286,8 @@ $('go').onclick = () => {
     const base = current!.name.replace(/\.[^.]+$/, '');
     const names = (ids: number[]) => ids.map((id) => d.parts.find((p: any) => p.id === id).name).join(' + ');
     const cls = (v: string) => (v.startsWith('PASS') ? 'pass' : v.startsWith('FAIL') ? 'fail' : '');
-    $('out').innerHTML += `<section><b>Result</b><p>${esc(m.decision)}</p>
+    $('out').innerHTML = $('out').innerHTML.replace(/<section id="res">[\s\S]*$/, '') + `<section id="res"><b>Result</b> <span class="${m.ready ? 'pass' : 'fail'}">${m.ready ? 'READY (all checks pass; fit still needs a test print)' : 'NOT READY'}</span><p>${esc(m.decision)}</p>
+      ${m.proposals.length > 1 ? `<div id="proposals"><span class="k">Seam proposals (see Cut lines; pick one to rebuild parts, joints and plates):</span>${m.proposals.map((p: any, k: number) => `<button data-k="${k}" class="${k === m.picked ? 'on' : ''}"><span class="sw" style="background:#${(k === m.picked ? 0xff3b5c : PROP_COLORS[k % 3]).toString(16).padStart(6, '0')}"></span>#${k + 1}: ${p.parts} parts, ${p.cuts} cut(s), cost ${p.cost}${p.hintMiss.some((x: number) => x > 0.05) ? ' · <span class="warn">misses a guided part</span>' : ''}</button>`).join('')}</div>` : ''}
       <a download="${base}_a1mini.zip" href="${url}">⬇ Download ZIP (${d.files.length} files: Bambu Studio project 3MF with all plates, 3MF per plate, STL per part)</a></section>
       <section><b>Estimates (geometric, not slicer output)</b><ul>${Object.entries(m.summary).map(([k, v]: any) => `<li><span class="k">${esc(k)}:</span> ${esc(String(v))}</li>`).join('')}</ul></section>
       ${m.cuts.length ? `<section><b>Seams</b><ul>${m.cuts.map((c: any) => `<li>Cut ${c.id}: seam ${c.seamLength.toFixed(0)} mm, visibility-weighted ${c.visibleSeam.toFixed(0)} mm${c.neck > 0.2 ? ' · at a neck/crease' : ''}${c.curved ? ` · curved into a fold (±${c.curved.maxDz} mm, ${(c.curved.gain * 100).toFixed(0)}% less visible)` : ''} · ${c.pins.length ? c.pins.map((p: any) => `${p.shape} ⌀${(2 * p.r).toFixed(1)}×${(2 * p.depth).toFixed(0)} mm`).join(', ') : '<span class="warn">no dowel</span>'}</li>`).join('')}</ul></section>` : ''}
@@ -219,7 +296,8 @@ $('go').onclick = () => {
       ${m.assemblyOrder.length ? `<section><b>Assembly sequence</b><ol>${m.assemblyOrder.map((a: any) => `<li>Seat ${a.pins.length} dowel(s) of cut ${a.cut} in ${names(a.b)}, then slide ${names(a.a)} onto them${a.ok ? '' : ' <span class="fail">collides</span>'}</li>`).join('')}</ol><div class="k">Each step joins two rigid groups across one flat seam; white arrows in Exploded view show the move. Dry-fit before glue.</div></section>` : ''}
       <section><b>Warnings / not verified</b><ul>${m.warnings.map((w: string) => `<li class="warn">${esc(w)}</li>`).join('')}
       <li class="k">Not verified: print strength, actual fit tolerance, seam visibility to a human eye. Support numbers are mesh estimates; slice in Bambu Studio for real support.</li></ul></section>`;
+    document.querySelectorAll<HTMLButtonElement>('#proposals button').forEach((b) => (b.onclick = () => run(+b.dataset.k!)));
     draw(true);
   });
-};
+}
 renderTabs();

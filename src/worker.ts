@@ -9,7 +9,7 @@ import { exportAll } from './core/exporters';
 const post = (m: unknown, t: Transferable[] = []) => (self as unknown as Worker).postMessage(m, t);
 
 self.onmessage = async (e: MessageEvent) => {
-  const { type, name, buf, height } = e.data;
+  const { type, name, buf, height, hints, minParts, maxParts, pick } = e.data;
   try {
     post({ type: 'progress', stage: 'Loading geometry kernel', frac: 0.01 });
     const w = await loadManifold(wasmUrl);
@@ -23,7 +23,7 @@ self.onmessage = async (e: MessageEvent) => {
     if (!solid) throw new Error('Mesh has no closed (watertight) component; cannot cut it safely. See import diagnostics.');
     const bb = solid.boundingBox();
     const scale = height / (bb.max[2] - bb.min[2]);
-    const r = prepare(w, solid, scale, 12, (stage, frac) => post({ type: 'progress', stage, frac: 0.08 + frac * 0.85 }));
+    const r = prepare(w, solid, scale, maxParts ?? 12, (stage, frac) => post({ type: 'progress', stage, frac: 0.08 + frac * 0.85 }), { hints, minParts, pick });
     post({ type: 'progress', stage: 'Exporting STL / 3MF', frac: 0.95 });
     const files = exportAll(r);
     const zip = zipSync({ ...files, 'README.txt': new TextEncoder().encode(readme(r)) });
@@ -34,7 +34,7 @@ self.onmessage = async (e: MessageEvent) => {
     }));
     post({
       type: 'result', report, parts, zip, files: Object.keys(files),
-      meta: { scale: r.scale, decision: r.decision, checks: r.checks, warnings: r.warnings, cuts: r.cuts, plates: r.plates, assemblyOrder: r.assemblyOrder, summary: r.summary },
+      meta: { ready: r.ready, proposals: r.proposals, picked: r.picked, scale: r.scale, decision: r.decision, checks: r.checks, warnings: r.warnings, cuts: r.cuts, plates: r.plates, assemblyOrder: r.assemblyOrder, summary: r.summary },
     }, [zip.buffer, ...parts.flatMap((p) => [p.assembled.buffer, p.placed.buffer])]);
   } catch (err) {
     post({ type: 'error', message: err instanceof Error ? err.message : String(err) });

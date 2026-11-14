@@ -71,7 +71,7 @@ export function curveSeam(w: Wasm, body: Manifold, h: number, f: Field, toWorld:
   const weight = (x: number, y: number, z: number, n: Vec2) => {
     const P = toWorld([x, y, z]), N = nWorld([n[0], n[1], 0]);
     const j = lookup(f, P, N, 2.5);
-    return j < 0 ? 1 : 0.15 + f.V[j] * (1 + 0.5 * f.D[j]) * (1 - 0.6 * Math.max(0, f.C[j]));
+    return j < 0 ? 1 : (0.15 + f.V[j] * (1 + 0.5 * f.D[j]) * (1 - 0.6 * Math.max(0, f.C[j]))) * f.W[j];
   };
   const samples: { x: number; y: number; dz: number }[] = [];
   const seamLoops: Vec2[][] = [];

@@ -9,7 +9,8 @@ import { analyzeSurface, partMesh, evenOut } from './analysis';
 import { evalDown, bestOrient, perp, fitYaw, USABLE, type OrientEval } from './orient';
 import { curveSeam } from './seam';
 import { seamFromCaps } from './cuts';
-import { search, makePart, registry, type SState } from './search';
+import { search, makePart, registry, mergeStrays, setGroups, setFullGlue, hintMiss, type SState } from './search';
+import { applyHints, mapHints, strokePlane, type Hints } from './hints';
 import { JOINT, rotTo, mat, planJoints, holeSolid, dowelSolid } from './joints';
 import { pack, BED } from './pack';
 
@@ -36,7 +37,13 @@ export interface PrepareResult {
   assemblyOrder: { cut: number; dir: number[]; a: number[]; b: number[]; pins: number[]; ok: boolean }[];
   summary: Record<string, number | string>;
   alternatives: Alternative[]; // unsplit model + Pareto-optimal candidates the search found (for reports)
+  /** Up to 3 ranked seam proposals (Guided Split preview): closed seam loops in the INPUT model's coordinates. */
+  proposals: Proposal[]; picked: number;
+  /** false when any joint is UNRESOLVED or a check failed: the kit is not ready to print as-is. */
+  ready: boolean;
 }
+export interface Proposal { parts: number; cuts: number; cost: number; loops: number[][][]; hintMiss: number[]; terms: Record<string, number> }
+export interface PrepareOpts { hints?: Hints; minParts?: number; pick?: number }
 type Progress = (stage: string, frac: number) => void;
 
 /** Rotation taking `down` to -Z (then optional yaw). Rows = (u, v, -down). */
@@ -76,32 +83,60 @@ function simplifyTo(m: Manifold, maxTri: number): Manifold {
 }
 
 
-export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: number, progress: Progress): PrepareResult {
+export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: number, progress: Progress, opts: PrepareOpts = {}): PrepareResult {
   const warnings: string[] = [];
   const checks: Record<string, string> = {};
   let solid = input.scale(scale);
   const b0 = solid.boundingBox();
-  solid = solid.translate([-(b0.min[0] + b0.max[0]) / 2, -(b0.min[1] + b0.max[1]) / 2, -b0.min[2]]);
-  const vol0 = solid.volume();
+  const shift = [-(b0.min[0] + b0.max[0]) / 2, -(b0.min[1] + b0.max[1]) / 2, -b0.min[2]];
+  solid = solid.translate(shift as [number, number, number]);
+  const toMm = (p: number[]) => p.map((v, k) => v * scale + shift[k]), toModel = (p: number[]) => p.map((v, k) => (v - shift[k]) / scale);
 
   // ---- 1. surface analysis (visibility / detail / concavity), once for the assembled model ----
   progress('Analysing surface visibility and detail', 0.02);
   const field = analyzeSurface(solid);
+  const hints = opts.hints ? mapHints(opts.hints, toMm) : { parts: [], seams: [], noCut: [] };
+  applyHints(field, hints);
+  setGroups(hints.parts.filter((g) => g.length));
+  const extra: { n: number[]; h: number }[] = hints.seams.map(strokePlane).filter((x): x is { n: number[]; h: number } => !!x);
+  if (hints.seams.length > extra.length) warnings.push(`${hints.seams.length - extra.length} seam stroke(s) too short/straight to define a loop; used only as a local "seam here" bias.`);
 
   // ---- 2. joint search over decompositions + orientations on a proxy mesh ----
   progress('Exploring splitting strategies', 0.08);
   // Disconnected shells of the input never touch: they are separate parts from the start (no seam, no joint).
-  const shells = solid.decompose().filter((m) => m.volume() >= 1);
-  if (shells.length > 1) warnings.push(`Input has ${shells.length} separate closed shells that do not touch each other; each is printed as its own part (position/glue by hand — they float in the original model).`);
+  // Shells that TOUCH (block figures built from boxes, a lamp resting on a hook) are one object: union them so the search
+  // cuts with real connectors; their contact faces become seam candidates and cheap-seam hints (the modeller's own joints).
+  const { shells, floating, contacts } = groupShells(w, solid.decompose().filter((m) => m.volume() >= 1), field);
+  extra.push(...contacts);
+  // reference for volume/reconstruction checks: the input with face contacts welded (the weld only fills ≤ 0.05 mm gaps)
+  const ref = shells.length === 1 ? shells[0] : w.Manifold.union(shells), vol0 = ref.volume(), weldVol = vol0 - solid.volume();
+  if (weldVol > 0.01) warnings.push(`Touching faces welded (${weldVol.toFixed(2)} mm³ of contact gap filled) so the pieces become one solid.`);
+  if (contacts.length) warnings.push(`${contacts.length} contact face(s) between touching input shells offered as seams.`);
+  if (floating.length) warnings.push(`UNRESOLVED JOINT: ${floating.length} shell(s) float without touching the rest (${floating.map((f) => `${f.vol.toFixed(0)} mm³, ${f.gap.toFixed(1)} mm away`).join('; ')}); no connector can be designed — they are printed separately and must be positioned/glued by hand. Often the link between them is an open (non-watertight) mesh dropped at import (chain, wire).`);
   registry.clear();
   const total = shells.reduce((a, m) => a + m.numTri(), 0);
   const roots = shells.map((m) => {
     let proxy = simplifyTo(m, Math.max(1500, Math.round(9000 * m.numTri() / total)));
     if (proxy === m) proxy = m.translate([0, 0, 0]); // the search frees its proxies; never hand it the real solid
+    // simplification can pinch off specks (a few mm³, touching nothing); every cut would then "make a crumb" and be rejected
+    const comps = proxy.decompose();
+    if (comps.length > 1) { const big = Math.max(...comps.map((q) => q.volume())); proxy = w.Manifold.compose(comps.filter((q) => q.volume() >= big * 0.002)); }
     return makePart(proxy, field, []);
   });
-  const sr = search(roots, field, { beam: 4, perPart: 6, maxParts, qualityCuts: 2, onProgress: (f) => progress('Exploring splitting strategies', 0.08 + 0.45 * f) });
-  const plan: SState = sr.best;
+  setFullGlue((n, h, bb) => fullGlue(solid, n, h, bb));
+  const sr = search(roots, field, { beam: 4, perPart: 6, maxParts, qualityCuts: 2, minParts: opts.minParts, extra, onProgress: (f) => progress('Exploring splitting strategies', 0.08 + 0.45 * f) });
+  // The proxy can miss thin section islands (hair strands, chain links) that no dowel fits on the full mesh. Unless the user
+  // picked a proposal, take the best-ranked one whose every seam island can be keyed on the FULL mesh.
+  const unkeyed = (st: SState) => st.cuts.reduce((a, c) => a + fullGlue(solid, c.n, c.h, registry.get(c.parent)?.bb), 0);
+  const keyedIdx = opts.pick === undefined ? sr.ranked.findIndex((st) => unkeyed(st) === 0) : -1;
+  if (keyedIdx > 0) warnings.push(`Proposal #1 would leave seam islands too thin for any connector; using proposal #${keyedIdx + 1} instead (all seams keyed).`);
+  const picked = keyedIdx > 0 ? keyedIdx : Math.min(Math.max(0, opts.pick ?? 0), sr.ranked.length - 1);
+  const plan: SState = sr.ranked[picked] ?? sr.best;
+  if (opts.minParts && plan.parts.length < opts.minParts) warnings.push(`Target of ${opts.minParts} parts not reached: no valid split with that many parts was found (best: ${plan.parts.length}); splitting further would cut through crumbs, thin sections or visible surfaces.`);
+  const miss = hintMiss(plan.parts);
+  miss.forEach((m, k) => { if (m > 0.05) warnings.push(`Guided part #${k + 1}: could not be fully isolated (${m >= 1 ? 'it stays with the bulk of the model' : 'part of the brushed area ends up in another part'}) — no closed seam around it passes the joint/fit checks.`); });
+  const proposals: Proposal[] = sr.ranked.map((st) => ({ parts: st.parts.length, cuts: st.cuts.length, cost: +st.cost.toFixed(0), hintMiss: hintMiss(st.parts), terms: Object.fromEntries(Object.entries(st.terms).map(([k, v]) => [k, +v.toFixed(0)])),
+    loops: st.cuts.flatMap((c) => seamLoops(solid, c.n, c.h, registry.get(c.parent)?.bb).map((l) => l.map(toModel))) }));
   if (!plan.feasible) warnings.push(`No decomposition within the part limit makes every part fit the ${USABLE} mm usable volume. Result is the best found; oversize parts are flagged.`);
 
   // ---- 3. replay the plan on the full-resolution mesh, cutting verified dowel holes at every seam ----
@@ -110,7 +145,7 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
   const proxyById = new Map(plan.parts.map((p) => [p.id, p]));
   const cuts: Cut[] = [];
   const pinParts: { m: Manifold; cut: number; toWorld: Matrix4; shape: 'round' | 'square' }[] = [];
-  let removedHoleVol = 0, droppedVol = 0;
+  let removedHoleVol = 0, droppedVol = 0, strays = 0;
   for (const c of plan.cuts) {
     progress(`Cutting seam ${c.id} and fitting connectors`, 0.55 + 0.1 * (c.id / Math.max(1, plan.cuts.length)));
     const mine = work.filter((x) => x.proxy === c.parent);
@@ -157,7 +192,6 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
         pinParts.push({ m: dowelSolid(w, p.shape, p.r, p.depth).transform(mat(toWorld)), cut: c.id, toWorld, shape: p.shape });
       }
     }
-    if (glue) warnings.push(`Cut ${c.id}: ${glue} section island(s) too thin for any dowel — glue-only, alignment not keyed.`);
     let cutBody = body;
     if (holeList.length) { const holes = w.Manifold.union(holeList); removedHoleVol += holes.intersect(body).volume(); cutBody = body.subtract(holes); }
     let above: Manifold, below: Manifold;
@@ -165,9 +199,32 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
     else [above, below] = cutBody.splitByPlane(n as [number, number, number], c.h);
 
     const next: Work[] = [];
+    let raw: { m: Manifold; side: number }[] = [];
     for (const [side, sgn] of [[above, 1], [below, -1]] as const) for (const piece of side.decompose()) {
       const v = piece.volume();
-      if (v < 1) { droppedVol += v; warnings.push(`Cut ${c.id}: dropped a ${v.toFixed(2)} mm³ fragment.`); continue; }
+      if (v < 1) { droppedVol += Math.max(0, v); if (v > 0.01) warnings.push(`Cut ${c.id}: dropped a ${v.toFixed(2)} mm³ fragment (degenerate sliver of a pinched input edge).`); continue; }
+      raw.push({ m: piece, side: sgn });
+    }
+    const ms = mergeStrays(raw); raw = ms.pieces; strays += ms.merged;
+    if (ms.merged) warnings.push(`Cut ${c.id}: ${ms.merged} stray fragment(s) on the wrong side of the seam re-attached to the part they belong to (e.g. chin tip below a neck plane).`);
+    // a dowel whose hole now lies inside ONE part (it was in a re-attached fragment's island) is pointless: refill, drop it
+    for (let k = infos.length - 1; k >= 0; k--) {
+      const hole = holeList[k];
+      const touching = raw.filter((q) => q.m.minGap(hole, 0.1) < 0.05);
+      if (touching.length !== 1) continue;
+      const fill = hole.intersect(body); removedHoleVol -= fill.volume();
+      touching[0].m = touching[0].m.add(fill);
+      const pi = pinParts.findIndex((q) => new Vector3().applyMatrix4(q.toWorld).distanceTo(new Vector3(...infos[k].center)) < 1e-6);
+      if (pi >= 0) pinParts.splice(pi, 1);
+      infos.splice(k, 1); holeList.splice(k, 1);
+    }
+    // Thin islands (hair strands, a sleeve edge) next to a keyed island between the SAME two parts are aligned by that key;
+    // only when the cut makes more than two parts (or no island is keyed against rotation) does a thin island stay unresolved.
+    const locked = infos.length >= 2 || infos.some((q) => q.shape === 'square');
+    if (glue && raw.length === 2 && locked) { warnings.push(`Cut ${c.id}: ${glue} thin seam island(s) (strands/edges) get no dowel; alignment comes from the keyed main island of the same two parts — glue them.`); glue = 0; }
+    if (glue) warnings.push(`UNRESOLVED JOINT — cut ${c.id}: ${glue} section island(s) too thin for any dowel; glue only, alignment not keyed.`);
+    for (const { m: piece, side: sgn } of raw) {
+      const v = piece.volume();
       // map the real piece to its proxy child: same side of the plane, nearest box centre, similar volume
       // (pieces on one side are disjoint; proxy and real mesh differ only by the simplification tolerance)
       const ids = sgn > 0 ? c.above : c.below;
@@ -290,8 +347,8 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
       const pp = pinParts.find((q) => new Vector3().applyMatrix4(q.toWorld).distanceTo(new Vector3(...pi.center)) < 1e-6)!;
       return holeSolid(w, pi.shape, pi.r, pi.depth).transform(mat(pp.toWorld));
     }));
-    const rebuilt = w.Manifold.union([...bodies.map((p) => p.solid), ...holesAll]).intersect(solid);
-    const missing = solid.subtract(rebuilt).volume(), extra = w.Manifold.union(bodies.map((p) => p.solid)).subtract(solid).volume();
+    const rebuilt = w.Manifold.union([...bodies.map((p) => p.solid), ...holesAll]).intersect(ref);
+    const missing = ref.subtract(rebuilt).volume(), extra = w.Manifold.union(bodies.map((p) => p.solid)).subtract(ref).volume();
     checks['Reconstruction: assembled parts vs original (outside connector cavities)'] = `${missing < vol0 * 1e-4 + 1 && extra < 1 ? 'PASS' : 'FAIL'} (missing ${missing.toFixed(2)} mm³, extra ${extra.toFixed(2)} mm³)`;
   }
   let maxOverlap = 0;
@@ -342,6 +399,13 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
   }
   checks['No overlapping parts on any plate'] = clash ? `FAIL (${clash} pairs)` : 'PASS';
 
+  const glueIsl = cuts.reduce((a, c) => a + c.glueOnlyIslands, 0);
+  checks['Every seam keyed by a connector (no UNRESOLVED JOINT)'] = glueIsl || floating.length
+    ? `FAIL (${glueIsl ? `${glueIsl} glue-only seam island(s)` : ''}${glueIsl && floating.length ? ', ' : ''}${floating.length ? `${floating.length} floating shell(s)` : ''})` : 'PASS';
+  checks['Stray fragments (re-attached to their part / dropped)'] = `${droppedVol > 1 ? 'FAIL' : 'PASS'} (${strays} re-attached, ${droppedVol.toFixed(2)} mm³ dropped)`;
+  if (strays && assemblyOrder.some((a) => !a.ok)) warnings.push('A re-attached fragment blocks a straight assembly move; see the sweep check.');
+  const ready = Object.values(checks).every((v) => !v.startsWith('FAIL'));
+
   // ---- summary metrics (geometric estimates) ----
   const sum = (f: (o: OrientEval) => number) => bodies.reduce((s, p) => s + (p.metrics ? f(p.metrics) : 0), 0);
   const summary: Record<string, number | string> = {
@@ -363,8 +427,76 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
   else decision = `${rootFits ? 'Fits whole, but splitting improves print quality' : 'Exceeds the A1 Mini usable volume'}: ${cuts.length} cut(s) → ${bodies.length} body parts + ${pinParts.length} dowels on ${pk.plates} plate(s). Cost ${plan.cost.toFixed(0)} vs unsplit ${rootFits ? sr.root.cost.toFixed(0) : 'infeasible'}.`;
   if (cuts.length) warnings.push(`Joint clearances are a baseline profile (${JOINT.clearance} mm radial, 0.5 mm mouth chamfer, ${JOINT.endGap} mm end gap). Print one test joint first: fit varies by printer and material.`);
   warnings.push('Support, stair-stepping and seam visibility are geometric estimates from the mesh, not slicer results.');
+  if (!ready) decision = `NOT READY — ${Object.entries(checks).filter(([, v]) => v.startsWith('FAIL')).map(([k]) => k).join('; ')}. ${decision}`;
   progress('Done', 1);
-  return { scale, parts, cuts, plates: pk.plates, decision, warnings, checks, assemblyOrder, summary, alternatives };
+  return { scale, parts, cuts, plates: pk.plates, decision, warnings, checks, assemblyOrder, summary, alternatives, proposals, picked, ready };
+}
+
+/**
+ * Union input shells that touch (gap < 0.05 mm) into connected objects. Coplanar opposite faces between touching shells
+ * are returned as seam planes, and the surface around each contact gets a cheap-seam bias (the model was built in
+ * these pieces; the eye already accepts a line there). Groups other than the largest that touch nothing are floating.
+ */
+function groupShells(w: Wasm, sh: Manifold[], field: ReturnType<typeof analyzeSurface>) {
+  const par = sh.map((_, i) => i), find = (i: number): number => (par[i] === i ? i : (par[i] = find(par[i])));
+  const contacts: { n: number[]; h: number }[] = [];
+  const welds: Manifold[] = [];
+  const planes = (m: Manifold) => { const g = m.getMesh(); const out = new Map<string, { n: number[]; h: number }>();
+    for (let t = 0; t < g.numTri; t++) { const P = [0, 1, 2].map((j) => [0, 1, 2].map((k) => g.vertProperties[g.triVerts[t * 3 + j] * g.numProp + k]));
+      const u = P[1].map((v, k) => v - P[0][k]), v = P[2].map((x, k) => x - P[0][k]);
+      const n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]], l = Math.hypot(...n); if (l < 1e-9) continue;
+      const nn = n.map((x) => x / l), h = nn[0] * P[0][0] + nn[1] * P[0][1] + nn[2] * P[0][2];
+      out.set(`${nn.map((x) => Math.round(x * 100)).join(',')}|${Math.round(h * 10)}`, { n: nn, h }); }
+    return out; };
+  const bb = sh.map((m) => m.boundingBox());
+  for (let i = 0; i < sh.length && sh.length <= 200; i++) for (let j = i + 1; j < sh.length; j++) {
+    const a = bb[i], b = bb[j];
+    if ([0, 1, 2].some((k) => a.min[k] > b.max[k] + 0.1 || b.min[k] > a.max[k] + 0.1)) continue;
+    if (sh[i].minGap(sh[j], 0.1) >= 0.05) continue;
+    const pb = planes(sh[j]);
+    for (const q of planes(sh[i]).values()) {
+      const k = `${q.n.map((x) => Math.round(-x * 100)).join(',')}|${Math.round(-q.h * 10)}`;
+      if (!pb.has(k)) continue;
+      // weld the face contact: faces that merely touch (gap ≤ 0.05 mm) stay separate bodies after a union
+      const d = q.n.map((x) => x * 0.08) as [number, number, number];
+      const weld = sh[i].translate(d).intersect(sh[j].translate(d.map((x) => -x) as [number, number, number]));
+      if (!weld.isEmpty()) { welds.push(weld); par[find(i)] = find(j); }
+      if ( contacts.some((c) => c.n.every((x, t) => Math.abs(Math.abs(x) - Math.abs(q.n[t])) < 0.02) && Math.abs(Math.abs(c.h) - Math.abs(q.h)) < 0.2)) continue;
+      const n = q.n[2] < 0 || (q.n[2] === 0 && q.n[1] < 0) ? q.n.map((x) => -x) : q.n; // search planes use the upper hemisphere
+      contacts.push({ n, h: n === q.n ? q.h : -q.h });
+    }
+    // contact rim: surface within the boxes' overlap (+2 mm) becomes a cheap seam
+    const lo = [0, 1, 2].map((k) => Math.max(a.min[k], b.min[k]) - 2), hi = [0, 1, 2].map((k) => Math.min(a.max[k], b.max[k]) + 2);
+    for (let s = 0; s < field.n; s++) if ([0, 1, 2].every((k) => field.cx[s * 3 + k] >= lo[k] && field.cx[s * 3 + k] <= hi[k])) field.W[s] = Math.min(field.W[s], 0.3);
+  }
+  field.memo.clear();
+  const groups = new Map<number, Manifold[]>();
+  sh.forEach((m, i) => { const r = find(i); groups.set(r, [...(groups.get(r) ?? []), m]); });
+  // touching shells without a weldable planar contact stay separate (and are reported as floating, never silently joined)
+  const shells = [...groups.values()].flatMap((g) => (g.length === 1 ? g : w.Manifold.union([...g, ...welds.filter((x) => g.some((m) => m.minGap(x, 0.2) < 0.15))]).decompose())).sort((x, y) => y.volume() - x.volume());
+  const floating = shells.slice(1).map((m) => ({ vol: m.volume(), gap: Math.min(...shells.filter((o) => o !== m).map((o) => o.minGap(m, 50))) }));
+  return { shells, floating, contacts };
+}
+
+/** Section islands of plane (n, h) on the full solid (inside the cut part's box) too thin for the smallest dowel. */
+function fullGlue(solid: Manifold, n: number[], h: number, bb?: number[]): number {
+  const f = rotTo(n, [0, 0, 1]), inv = f.clone().invert();
+  let glue = 0;
+  for (const isl of solid.transform(mat(f)).slice(h).decompose()) {
+    const b = isl.bounds();
+    const c = new Vector3((b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, h).applyMatrix4(inv).toArray();
+    if (bb && !c.every((v, k) => v >= bb[k] - 2 && v <= bb[k + 3] + 2)) continue;
+    if (isl.offset(-(JOINT.minPinR + JOINT.clearance + JOINT.wall + 0.2), 'Round').isEmpty()) glue++;
+  }
+  return glue;
+}
+
+/** Closed seam loops of plane (n, h) on the solid, limited to the cut part's box; 3D points in the prepared frame. */
+function seamLoops(solid: Manifold, n: number[], h: number, bb?: number[]): number[][][] {
+  const f = rotTo(n, [0, 0, 1]), inv = f.clone().invert();
+  const polys = solid.transform(mat(f)).slice(h).toPolygons() as number[][][];
+  return polys.map((poly) => poly.map((p) => new Vector3(p[0], p[1], h).applyMatrix4(inv).toArray()))
+    .filter((l) => !bb || l.every((p) => p.every((v, k) => v >= bb[k] - 2 && v <= bb[k + 3] + 2)));
 }
 
 const bestSplitCost = (sr: { frontier: SState[] }) => { const s = sr.frontier.filter((x) => x.cuts.length).sort((a, b) => a.cost - b.cost)[0]; return s ? s.cost.toFixed(0) : null; };
