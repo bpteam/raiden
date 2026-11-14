@@ -482,12 +482,15 @@ function groupShells(w: Wasm, sh: Manifold[], field: ReturnType<typeof analyzeSu
 function fullGlue(solid: Manifold, n: number[], h: number, bb?: number[]): number {
   const f = rotTo(n, [0, 0, 1]), inv = f.clone().invert();
   let glue = 0;
-  for (const isl of solid.transform(mat(f)).slice(h).decompose()) {
+  // called for every search candidate on the full mesh: free every wasm temporary (heap is limited)
+  const t = solid.transform(mat(f)), cs = t.slice(h); t.delete();
+  for (const isl of cs.decompose()) {
     const b = isl.bounds();
     const c = new Vector3((b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, h).applyMatrix4(inv).toArray();
-    if (bb && !c.every((v, k) => v >= bb[k] - 2 && v <= bb[k + 3] + 2)) continue;
-    if (isl.offset(-(JOINT.minPinR + JOINT.clearance + JOINT.wall + 0.2), 'Round').isEmpty()) glue++;
+    if (!bb || c.every((v, k) => v >= bb[k] - 2 && v <= bb[k + 3] + 2)) { const o = isl.offset(-(JOINT.minPinR + JOINT.clearance + JOINT.wall + 0.2), 'Round'); if (o.isEmpty()) glue++; o.delete(); }
+    isl.delete();
   }
+  cs.delete();
   return glue;
 }
 
