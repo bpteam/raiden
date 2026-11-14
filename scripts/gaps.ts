@@ -1,0 +1,11 @@
+import { readFileSync } from 'node:fs';
+import { importModel } from '../src/core/importers';
+import { loadManifold, toManifold } from '../src/core/geom';
+const [file, H] = process.argv.slice(2);
+const w = await loadManifold(); const b = readFileSync(file);
+const soup = await importModel(file, b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
+const { solid } = toManifold(w, soup.pos); const bb = solid!.boundingBox();
+const s = solid!.scale(+H / (bb.max[2] - bb.min[2]));
+const sh = s.decompose().filter((m) => m.volume() >= 1);
+sh.forEach((m, i) => { const q = m.boundingBox(); console.log(i, m.volume().toFixed(0), q.min.map((x) => x.toFixed(1)).join(','), q.max.map((x) => x.toFixed(1)).join(',')); });
+for (let i = 0; i < sh.length; i++) for (let j = i + 1; j < sh.length; j++) console.log(i, j, 'gap', sh[i].minGap(sh[j], 20).toFixed(3));

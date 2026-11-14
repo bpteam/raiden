@@ -16,7 +16,7 @@ import { shot, ISO, type Obj } from './viz';
 const [file, hArg, outDir, legacyArg] = process.argv.slice(2);
 const legacy = legacyArg?.startsWith('--legacy=') ? resolve(legacyArg.slice(9)) : null;
 const { prepare } = await import(legacy ? `${legacy}/prepare.ts` : '../src/core/prepare');
-const tag = legacy ? 'before' : 'after';
+const tag = process.env.TAG ?? (legacy ? 'before' : 'after');
 const name = basename(file).replace(/\.[^.]+$/, '');
 mkdirSync(outDir, { recursive: true });
 const w = await loadManifold();
@@ -26,7 +26,8 @@ const { solid } = toManifold(w, soup.pos);
 const bb = solid!.boundingBox();
 const scale = +hArg / (bb.max[2] - bb.min[2]);
 const t0 = Date.now();
-const r = prepare(w, solid!, scale, 12, () => {});
+// env HINTS=<json> / MIN_PARTS=<n>: Guided Split / Target Parts (ignored by the legacy pipeline); TAG overrides the file suffix
+const r = prepare(w, solid!, scale, 12, () => {}, { hints: process.env.HINTS ? JSON.parse(readFileSync(process.env.HINTS, 'utf8')) : undefined, minParts: process.env.MIN_PARTS ? +process.env.MIN_PARTS : undefined });
 const ms = Date.now() - t0;
 // the assembled frame of `prepare` is the scaled model centred in XY, standing on z = 0
 const s0 = solid!.scale(scale), b0 = s0.boundingBox();

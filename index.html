@@ -18,7 +18,8 @@
   button:disabled { opacity:.5; cursor:default; }
   .row { display:flex; gap:6px; } .row > * { flex:1; }
   .tabs { position:absolute; top:10px; left:10px; display:flex; gap:4px; z-index:2; }
-  .tabs button { width:auto; } .tabs button.on { background:var(--accent); color:#06121d; }
+  .tabs button { width:auto; } .tabs button.on, #brushes button.on { background:var(--accent); color:#06121d; }
+  #proposals button { text-align:left; margin-top:4px; } #proposals button.on { outline:2px solid var(--accent); }
   #sliderBox { position:absolute; bottom:12px; left:50%; transform:translateX(-50%); width:min(420px, 80%); z-index:2; background:#1d2026cc; padding:6px 10px; border-radius:8px; }
   .bar { height:6px; background:#262a31; border-radius:3px; overflow:hidden; margin-top:6px; } .bar > div { height:100%; background:var(--accent); width:0; }
   section { border-top:1px solid var(--line); margin-top:12px; padding-top:8px; }
@@ -39,6 +40,15 @@
   <input type="file" id="file" accept=".stl,.3mf,.obj,.glb,.gltf" />
   <label>Target model height, mm (Z after import)</label>
   <input type="number" id="height" value="150" min="5" max="2000" />
+  <label>Mode</label>
+  <div class="row"><select id="mode"><option value="auto">Auto Split</option><option value="guided">Guided Split (brush intent)</option></select></div>
+  <div class="row"><div><label>Min parts (target)</label><input type="number" id="minParts" placeholder="auto" min="1" max="12" /></div><div><label>Max parts</label><input type="number" id="maxParts" value="12" min="1" max="12" /></div></div>
+  <div id="guided" hidden>
+    <label>Brush (left-drag on the model in Original / Cut lines view; drag off the model to orbit)</label>
+    <div class="row" id="brushes"><button data-b="part">Own part</button><button data-b="seam">Seam here</button><button data-b="nocut">No-cut</button><button data-b="erase">Erase</button></div>
+    <div class="row" style="margin-top:6px"><button id="newGroup">+ New part group</button><button id="clearHints">Clear hints</button></div>
+    <div id="hintInfo" class="k" style="margin-top:6px"></div>
+  </div>
   <div class="row"><button class="primary" id="go" disabled>Auto Prepare</button><button id="cancel" disabled style="margin-top:12px">Cancel</button></div>
   <div id="stage" class="k" style="margin-top:8px">Pick a model.</div>
   <div class="bar"><div id="bar"></div></div>

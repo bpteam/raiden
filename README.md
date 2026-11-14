@@ -27,9 +27,26 @@ Decomposition, orientation and packing are decided **together**: every candidate
 8. **Validation**: volume, reconstruction (assembled parts + connector cavities vs original), pairwise overlap, manifoldness, dowels clear of every body when seated, assembly sequence (planar BSP joins are collision-free by construction, re-checked with a sampled sweep), every part on the bed inside the volume, no overlaps per plate (exact booleans).
 9. **Export** (`exporters.ts`): `project_a1mini.3mf` — a Bambu Studio project laid out like Bambu Studio's own exports (multi-plate grid, `model_settings.config` plates, presets A1 mini 0.4 / 0.20 mm Standard / PLA Basic, tree supports on); plus a generic 3MF per plate and an STL per part. `scripts/bbs.ts` reopens and slices it with the Bambu Studio CLI and compares plates/objects/heights.
 
+## Modes: Auto, Target Parts, Guided Split
+All three run the same search, joint planner and validation; they only add terms to the search.
+- **Auto Split** — as above; the unsplit model is always a candidate.
+- **Target Parts** — *Min parts* / *Max parts*. A target, not an order: if no valid split reaches it, the result says so and keeps the best valid one.
+- **Guided Split** (`src/core/hints.ts`) — brush on the model (raycast onto the surface, stored in model coordinates, so it stays put when the view rotates):
+  - *Own part* (groups via *+ New part group*): the search must end with one part holding ≥ 90 % of the brushed points that is not the bulk of the model and not much larger than the brushed area. Extra candidate planes are generated just below the brushed area (`hintPlanes`), around the direction from the part's centroid to the brush; the search keeps cutting parts that hold an unsatisfied group.
+  - *Seam here*: soft bias — seam weight ×0.12 within 6 mm; a loop-like stroke also adds its least-squares plane as a candidate (then curved into nearby folds as usual).
+  - *No-cut*: seam weight ×40 within 6 mm (face, strands, chain).
+  - *Find Best Cuts* returns up to 3 ranked proposals; *Cut lines* shows their closed seam loops on the original (picked one red). Picking another proposal rebuilds parts, joints, orientation and plates. Changing any hint discards the previous result and export.
+
+## Joint and fragment rules (fail loudly, never fake success)
+- Input shells that **touch** (gap ≤ 0.05 mm, e.g. box-built figurines) are welded along their coplanar contact faces into one solid; the contact planes become seam candidates and their rims cheap seams. Shells that do not touch are printed separately and reported as **UNRESOLVED JOINT** (often the link between them is an open mesh dropped at import — the Lantern chain).
+- A minor piece on one side of a cut that touches a piece across it (chin tip under a neck plane) is re-attached to that piece; a dowel that then lies inside one part is removed and its hole refilled. A side's largest piece is never moved.
+- Thin seam islands next to a keyed island between the same two parts are aligned by that key (glue noted). Otherwise a seam island without a connector is **UNRESOLVED JOINT**: the result is marked **NOT READY** and the check fails.
+- The search checks section islands on the full-resolution mesh (the proxy smooths strands away), and glue-only islands cost as much as a large visible seam.
+
 ## Known limits
 
-- Planar cuts only (no geodesic/non-planar seams); seams follow natural boundaries only where a plane can.
+- Cuts are planes, optionally bent into a nearby fold (±12 mm height field). No free-form geodesic seams: a brushed rough seam becomes its best-fit plane; seams follow natural boundaries only where such a surface can.
+- Guided *Own part* is geometric: it isolates the brushed region with the cheapest valid seam near it, it does not know what a head is.
 - Visibility/detail are geometric proxies; "front" is assumed to be glTF +Z. A face with little relief scores as a smooth visible surface, not as "a face".
 - Support/stair/seam numbers in the app are geometric estimates, not slicer output. Slice in Bambu Studio for real support and time.
 - Joint fit profile (0.2 mm radial clearance, 0.5 mm chamfer, 0.6 mm end gap) is a baseline, untested on hardware — print a test joint first.
