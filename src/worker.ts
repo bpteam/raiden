@@ -29,7 +29,7 @@ self.onmessage = async (e: MessageEvent) => {
     const zip = zipSync({ ...files, 'README.txt': new TextEncoder().encode(readme(r)) });
     const parts = r.parts.map((p) => ({
       id: p.id, name: p.name, role: p.role, plate: p.plate, volume: p.volume, height: p.height, supportArea: p.supportArea, bedContact: p.bedContact,
-      insertDir: p.insertDir, parent: p.parent, blocked: p.blocked, cutFaces: p.cutFaces,
+      cutFaces: p.cutFaces,
       assembled: meshToSoup(p.solid), placed: meshToSoup(p.placed!),
     }));
     post({
@@ -47,8 +47,8 @@ function readme(r: ReturnType<typeof prepare>): string {
     r.decision, '',
     'Files: part_*.stl (oriented, placed in plate coordinates), pin_*.stl (dowels), plate_N.3mf (one per build plate).', '',
     'Checks:', ...Object.entries(r.checks).map(([k, v]) => `  ${k}: ${v}`), '',
-    'Assembly order (insert each part along the given direction onto its neighbour; pins go into the holes first):',
-    ...r.assemblyOrder.map((a, i) => `  ${i + 1}. part_${a.part}${a.onto ? ` onto part_${a.onto}, direction ${a.dir!.map((v) => v.toFixed(2)).join(', ')}${a.ok ? '' : ' (BLOCKED in sweep check)'}` : ' (base)'}`),
+    'Assembly (each step joins two rigid groups across one flat seam; seat that cut\'s dowels in the second group first):',
+    ...r.assemblyOrder.map((a, i) => `  ${i + 1}. cut ${a.cut}: dowels ${a.pins.map((id) => r.parts[id - 1].name).join(', ') || 'none'} into ${a.b.map((id) => r.parts[id - 1].name).join(' + ')}; slide ${a.a.map((id) => r.parts[id - 1].name).join(' + ')} on along (${a.dir.map((v) => v.toFixed(2)).join(', ')})${a.ok ? '' : ' (COLLIDES in sweep check)'}`),
     '', 'Warnings:', ...r.warnings.map((w) => `  - ${w}`),
   ].join('\n');
 }

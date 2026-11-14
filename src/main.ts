@@ -38,11 +38,20 @@ function resize() { const r = host.getBoundingClientRect(); renderer?.setSize(r.
 addEventListener('resize', resize); resize();
 renderer?.setAnimationLoop(() => { controls.update(); renderer!.render(scene, camera); });
 
-function meshOf(soup: Float32Array, color: number) {
+/** Mesh with seam (cut-plane) triangles tinted, so every joint surface is visible at a glance. */
+function meshOf(soup: Float32Array, color: number, seams: { normal: number[]; offset: number }[] = []) {
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(soup, 3));
   g.computeVertexNormals();
-  return new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.05, flatShading: false }));
+  const base = new THREE.Color(color), seam = new THREE.Color(0xff3b5c);
+  const col = new Float32Array(soup.length);
+  for (let t = 0; t < soup.length; t += 9) {
+    const on = seams.some((f) => [0, 3, 6].every((o) => Math.abs(soup[t + o] * f.normal[0] + soup[t + o + 1] * f.normal[1] + soup[t + o + 2] * f.normal[2] - f.offset) < 0.05));
+    const c = on ? seam : base;
+    for (let k = 0; k < 9; k += 3) { col[t + k] = c.r; col[t + k + 1] = c.g; col[t + k + 2] = c.b; }
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.05 }));
 }
 function frame(obj: THREE.Object3D) {
   const b = new THREE.Box3().setFromObject(obj);
@@ -99,18 +108,34 @@ function draw(refit = false) {
       bodies.forEach((p: any) => center.union(geo[result.parts.indexOf(p)].boundingBox));
       const c = center.getCenter(new THREE.Vector3());
       const size = center.getSize(new THREE.Vector3()).length();
+      // Explode along the cut tree: at every cut both sides back off along its normal, so the picture is the real assembly path.
+      const step = k * size * 0.18;
+      const contrib = (id: number, skipCut = -1) => {
+        const v = new THREE.Vector3();
+        for (const st of result.meta.assemblyOrder) {
+          if (st.cut === skipCut) continue;
+          const n = new THREE.Vector3(...st.dir).negate();
+          if (st.a.includes(id)) v.addScaledVector(n, step); else if (st.b.includes(id)) v.addScaledVector(n, -step);
+        }
+        return v;
+      };
+      const offs = new Map<number, THREE.Vector3>(bodies.map((p: any) => [p.id, contrib(p.id)]));
+      const pinOff = (p: any) => {
+        const st = result.meta.assemblyOrder.find((x: any) => x.pins.includes(p.id));
+        return st ? contrib(st.a[0], st.cut) : new THREE.Vector3();
+      };
+      if (view === 'Exploded' && k > 0.05) for (const st of result.meta.assemblyOrder) {
+        const bb = new THREE.Box3();
+        st.a.forEach((id: number) => bb.union(geo[result.parts.findIndex((q: any) => q.id === id)].boundingBox.clone().translate(offs.get(id)!)));
+        const dir = new THREE.Vector3(...st.dir);
+        root.add(new THREE.ArrowHelper(dir, bb.getCenter(new THREE.Vector3()).addScaledVector(dir, -size * 0.12), size * 0.1, st.ok ? 0xffffff : 0xff6b6b, size * 0.025, size * 0.015));
+      }
       result.parts.forEach((p: any, j: number) => {
-        const m = meshOf(p.assembled, colorOf(p, j));
+        const m = meshOf(p.assembled, colorOf(p, j), view === 'Exploded' ? p.cutFaces : []);
         if (view === 'Exploded') {
           const pc = geo[j].boundingBox.getCenter(new THREE.Vector3());
-          const d = pc.clone().sub(c);
-          const off = p.role === 'pin' ? d.multiplyScalar(k * 0.9) : d.multiplyScalar(k * 0.8);
+          const off = p.role === 'pin' ? pinOff(p) : offs.get(p.id) ?? pc.clone().sub(c).multiplyScalar(k * 0.8);
           m.position.copy(off);
-          if (p.insertDir && k > 0.05) {
-            const dir = new THREE.Vector3(...p.insertDir);
-            const a = new THREE.ArrowHelper(dir, pc.clone().add(off).addScaledVector(dir, -size * 0.08), size * 0.07, p.blocked ? 0xff6b6b : 0xffffff, size * 0.02, size * 0.012);
-            root.add(a);
-          }
         }
         root.add(m);
       });
@@ -181,12 +206,14 @@ $('go').onclick = () => {
     const m = d.meta;
     const url = URL.createObjectURL(new Blob([d.zip], { type: 'application/zip' }));
     const base = current!.name.replace(/\.[^.]+$/, '');
+    const names = (ids: number[]) => ids.map((id) => d.parts.find((p: any) => p.id === id).name).join(' + ');
     const cls = (v: string) => (v.startsWith('PASS') ? 'pass' : v.startsWith('FAIL') ? 'fail' : '');
     $('out').innerHTML += `<section><b>Result</b><p>${esc(m.decision)}</p>
       <a download="${base}_a1mini.zip" href="${url}">⬇ Download ZIP (${d.files.length} files: STL per part + 3MF per plate)</a></section>
+      ${m.cuts.length ? `<section><b>Seams</b><ul>${m.cuts.map((c: any) => `<li>Cut ${c.id}: seam ${c.seamLength.toFixed(0)} mm, ${(c.hidden * 100).toFixed(0)}% under overlapping geometry · ${c.pins.length ? c.pins.map((p: any) => `${p.shape} ⌀${(2 * p.r).toFixed(1)}×${(2 * p.depth).toFixed(0)} mm`).join(', ') : '<span class="warn">no dowel</span>'}</li>`).join('')}</ul></section>` : ''}
       <section><b>Verification</b><ul>${Object.entries(m.checks).map(([k, v]: any) => `<li><span class="k">${esc(k)}:</span> <span class="${cls(v)}">${esc(v)}</span></li>`).join('')}</ul></section>
       <section><b>Parts</b><ul>${d.parts.map((p: any, j: number) => `<li><span class="sw" style="background:#${colorOf(p, j).toString(16).padStart(6, '0')}"></span>${p.name} · plate ${p.plate + 1}${p.role === 'body' ? ` · h ${p.height.toFixed(0)} mm · support ≈ ${(p.supportArea / 100).toFixed(1)} cm²` : ''}</li>`).join('')}</ul></section>
-      ${m.assemblyOrder.length ? `<section><b>Assembly sequence</b><ol>${m.assemblyOrder.map((a: any) => `<li>part_${a.part}${a.onto ? ` → onto part_${a.onto}` : ' (base)'}${a.ok === false ? ' <span class="fail">blocked</span>' : ''}</li>`).join('')}</ol><div class="k">Insert dowels into the base side first. Arrows in Exploded view show insertion direction.</div></section>` : ''}
+      ${m.assemblyOrder.length ? `<section><b>Assembly sequence</b><ol>${m.assemblyOrder.map((a: any) => `<li>Seat ${a.pins.length} dowel(s) of cut ${a.cut} in ${names(a.b)}, then slide ${names(a.a)} onto them${a.ok ? '' : ' <span class="fail">collides</span>'}</li>`).join('')}</ol><div class="k">Each step joins two rigid groups across one flat seam; white arrows in Exploded view show the move. Dry-fit before glue.</div></section>` : ''}
       <section><b>Warnings / not verified</b><ul>${m.warnings.map((w: string) => `<li class="warn">${esc(w)}</li>`).join('')}
       <li class="k">Not verified: print strength, actual fit tolerance, seam visibility to a human eye, slicer support placement.</li></ul></section>`;
     draw(true);

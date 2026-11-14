@@ -7,10 +7,12 @@ import type { Wasm } from './geom';
 
 export const A1_MINI = { x: 180, y: 180, z: 180 };
 const USABLE = 176; // 2 mm safety margin per side
+// A cut face on the bed is flat, hidden, support-free and keeps dowel holes vertical (round, accurate). Worth ~15 cm² of extra support elsewhere.
+const CUT_DOWN_BONUS = 1500;
 // Internal defaults for 0.4 mm nozzle PLA-class material. Test-print a joint first: printers differ.
-export const JOINT = { pinR: 2.5, pinRSmall: 1.5, clearance: 0.15, depth: 6, depthSmall: 4, wall: 1.6, endGap: 0.4 };
+export const JOINT = { minPinR: 1.5, maxPinR: 4, clearance: 0.2, minDepth: 4, maxDepth: 14, wall: 1.6, endGap: 0.6 };
 
-export interface Cut { id: number; normal: number[]; offset: number; pins: PinInfo[]; area: number; islands: number; glueOnlyIslands: number }
+export interface Cut { id: number; normal: number[]; offset: number; pins: PinInfo[]; area: number; islands: number; glueOnlyIslands: number; seamLength: number; hidden: number }
 export interface PinInfo { center: number[]; axis: number[]; r: number; depth: number; shape: 'round' | 'square'; verified: boolean }
 export interface PartOut {
   id: number; name: string; role: 'body' | 'pin';
@@ -18,11 +20,12 @@ export interface PartOut {
   placed?: Manifold;          // oriented + placed on its plate
   plate: number; orient: Matrix4; place: Matrix4; // assembled -> plate frame = place * orient
   cutFaces: { normal: number[]; offset: number }[]; // planes on this part's boundary (seams), outward normals
-  supportArea: number; bedContact: number; height: number; volume: number; insertDir?: number[]; parent?: number; blocked?: boolean;
+  supportArea: number; bedContact: number; height: number; volume: number;
 }
 export interface PrepareResult {
   scale: number; parts: PartOut[]; cuts: Cut[]; plates: number; decision: string; warnings: string[]; checks: Record<string, string>;
-  assemblyOrder: { part: number; onto: number | null; dir: number[] | null; ok: boolean | null }[];
+  /** Reverse cut order: join sub-assembly `a` (side the normal points to) onto `b` by moving it along -dir. Pins of that cut go into `b` first. */
+  assemblyOrder: { cut: number; dir: number[]; a: number[]; b: number[]; pins: number[]; ok: boolean }[];
 }
 type Progress = (stage: string, frac: number) => void;
 
@@ -57,6 +60,7 @@ function overhang(m: Manifold): { support: number; contact: number; height: numb
 
 function candidateDirs(cutFaces: { normal: number[] }[]): number[][] {
   const axes = [[0, 0, -1], [0, 0, 1], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0]];
+  for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) axes.push([x, y, z].map((v) => v / Math.sqrt(3)));
   return [...cutFaces.map((c) => c.normal), ...axes];
 }
 
@@ -64,21 +68,59 @@ function candidateDirs(cutFaces: { normal: number[] }[]): number[][] {
 function bestOrientation(m: Manifold, cutFaces: { normal: number[] }[]): Orient {
   let best: Orient | null = null;
   const cuts = new Set(cutFaces.map((c) => c.normal.join()));
+  const hull = m.hull();
   for (const d of candidateDirs(cutFaces)) {
-    for (const yaw of [0, 45]) {
-      const rot = new Matrix4().makeRotationZ((yaw * Math.PI) / 180).multiply(rotTo(d, [0, 0, -1]));
-      const tm = m.transform(mat(rot));
-      const o = overhang(tm);
-      tm.delete();
-      const fits = o.d[0] <= USABLE && o.d[1] <= USABLE && o.d[2] <= USABLE;
-      // Support touching visible surfaces is the main quality cost; low contact on tall parts risks tipping.
-      const tip = o.contact < 1e-6 ? 50 : Math.max(0, o.height / Math.sqrt(o.contact) - 8) * 2;
-      const score = (fits ? 0 : 1e9) + o.support + tip * 10 + o.height * 0.5 - (cuts.has(d.join()) ? 30 : 0);
-      if (!best || score < best.score) best = { rot, support: o.support, contact: o.contact, height: o.height, fits, score };
+    const down = rotTo(d, [0, 0, -1]);
+    const tm = m.transform(mat(down));
+    const o = overhang(tm); // support area does not depend on yaw, so compute once per direction
+    tm.delete();
+    // Yaw only matters for the bed footprint: search it on the convex hull (5° steps), keep the smallest footprint that fits.
+    let rot: Matrix4 | null = null, foot = Infinity;
+    for (let yaw = 0; yaw < 180; yaw += 5) {
+      const r = new Matrix4().makeRotationZ((yaw * Math.PI) / 180).multiply(down);
+      const t = hull.transform(mat(r));
+      const e = dims(t);
+      t.delete();
+      if (e[0] <= USABLE && e[1] <= USABLE && e[2] <= USABLE && e[0] * e[1] < foot) { foot = e[0] * e[1]; rot = r; }
     }
+    const fits = !!rot;
+    // Support touching visible surfaces is the main quality cost; low contact on tall parts risks tipping.
+    const tip = o.contact < 1e-6 ? 50 : Math.max(0, o.height / Math.sqrt(o.contact) - 8) * 2;
+    const score = (fits ? 0 : 1e9) + o.support + tip * 10 + o.height * 0.5 - (cuts.has(d.join()) ? CUT_DOWN_BONUS : 0);
+    if (!best || score < best.score) best = { rot: rot ?? down, support: o.support, contact: o.contact, height: o.height, fits, score };
   }
+  hull.delete();
   return best!;
 }
+
+/** Can this piece stand on its seam (outward normal `down`) and still fit the bed, with some yaw? */
+function fitsSeamDown(m: Manifold, down: number[]): boolean {
+  const h = m.hull();
+  const base = rotTo(down, [0, 0, -1]);
+  let ok = false;
+  for (let yaw = 0; yaw < 180 && !ok; yaw += 15) {
+    const t = h.transform(mat(new Matrix4().makeRotationZ((yaw * Math.PI) / 180).multiply(base)));
+    ok = dims(t).every((x) => x <= USABLE);
+    t.delete();
+  }
+  h.delete();
+  return ok;
+}
+
+/** Lower-bound-ish estimate of how many bed-sized pieces this solid needs: Π⌈extent/176⌉ at its best of a few orientations. */
+function estParts(m: Manifold): number {
+  const h = m.hull();
+  let best = Infinity;
+  for (const r of EST_ROTS) {
+    const t = h.transform(mat(r));
+    best = Math.min(best, dims(t).reduce((a, d) => a * Math.max(1, Math.ceil((d - 0.5) / USABLE)), 1));
+    t.delete();
+  }
+  h.delete();
+  return best;
+}
+const EST_ROTS = [new Matrix4(), new Matrix4().makeRotationZ(Math.PI / 4), new Matrix4().makeRotationX(Math.PI / 4), new Matrix4().makeRotationY(Math.PI / 4),
+  new Matrix4().makeRotationX(Math.PI / 4).multiply(new Matrix4().makeRotationZ(Math.PI / 4))];
 
 function fitsSomehow(m: Manifold): boolean {
   if (Math.max(...dims(m)) <= USABLE) return true;
@@ -96,91 +138,273 @@ function fitsSomehow(m: Manifold): boolean {
 }
 
 // ---------- cut search ----------
-interface Candidate { normal: number[]; offset: number; cost: number; area: number; islands: CrossSection[]; frame: Matrix4 }
+interface Candidate { normal: number[]; offset: number; cost: number; area: number; islands: CrossSection[]; frame: Matrix4; seamLength: number; hidden: number }
+interface Section { h: number; area: number; per: number; covered: number; big: number; small: number; thin: number }
 
-const CUT_NORMALS = [[0, 0, 1], [1, 0, 0], [0, 1, 0], [0.5, 0, 0.866], [-0.5, 0, 0.866], [0, 0.5, 0.866], [0, -0.5, 0.866]];
+// Plane normals over a hemisphere: vertical, 20° and 40° tilts at 8 azimuths, horizontal at 8 azimuths.
+const CUT_NORMALS: number[][] = [[0, 0, 1]];
+for (const tilt of [20, 40, 90]) for (let a = 0; a < 8; a++) {
+  const t = (tilt * Math.PI) / 180, az = (a * Math.PI) / 4;
+  CUT_NORMALS.push([Math.sin(t) * Math.cos(az), Math.sin(t) * Math.sin(az), Math.cos(t)]);
+}
+// keep one of each ± pair for horizontal normals (same plane family)
+const NORMALS = CUT_NORMALS.filter((n) => !(Math.abs(n[2]) < 1e-9 && (n[0] < -1e-9 || (Math.abs(n[0]) < 1e-9 && n[1] < 0))));
 
-function sections(m: Manifold, n: number[], samples: number) {
-  const frame = rotTo(n, [0, 0, 1]);
-  const r = m.transform(mat(frame));
-  const b = r.boundingBox();
-  const out: { h: number; cs: CrossSection; area: number }[] = [];
-  for (let i = 1; i < samples; i++) {
-    const h = b.min[2] + ((b.max[2] - b.min[2]) * i) / samples;
-    const cs = r.slice(h);
-    out.push({ h, cs, area: cs.area() });
+const perimeter = (cs: CrossSection) => cs.toPolygons().reduce((s, poly) => s + poly.reduce((t, p, i) => { const q = poly[(i + 1) % poly.length]; return t + Math.hypot(q[0] - p[0], q[1] - p[1]); }, 0), 0);
+
+/**
+ * Fraction of seam length hidden under overlapping geometry: a seam point is hidden when the solid just above or just below
+ * extends past it (cape/skirt hem, collar, hair, sleeve cuff). Measured by sampling edge midpoints against neighbouring slices.
+ */
+export function coveredFraction(cs: CrossSection, upper: CrossSection, lower: CrossSection, delta: number): number {
+  const polys = cs.toPolygons() as Vec2[][];
+  const U = upper.toPolygons() as Vec2[][], D = lower.toPolygons() as Vec2[][];
+  const edges: [Vec2, Vec2, number][] = [];
+  for (const poly of polys) for (let i = 0; i < poly.length; i++) { const a = poly[i], b = poly[(i + 1) % poly.length]; edges.push([a, b, Math.hypot(b[0] - a[0], b[1] - a[1])]); }
+  const stride = Math.max(1, Math.floor(edges.length / 160));
+  const reach = 10; // mm: an overlapping hem/collar/hair lip within this distance hides the seam
+  let tot = 0, hid = 0;
+  for (let e = 0; e < edges.length; e += stride) {
+    const [a, b, l] = edges[e];
+    if (!l) continue;
+    const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+    let nx = (b[1] - a[1]) / l, ny = -(b[0] - a[0]) / l;
+    if (inPolys([mx + nx * 0.05, my + ny * 0.05], polys)) { nx = -nx; ny = -ny; } // make it point outward
+    const hiddenBy = (P: Vec2[][]) => {
+      // Walk outward from the seam at a neighbouring height. Air then material = a lip overhanging the seam.
+      // Material straight away is just the surface sloping; it only hides the seam when it juts out much further than it rises.
+      let sawAir = false, solidRun = 0;
+      for (let d = 0.5; d <= reach; d += 0.75) {
+        const inside = inPolys([mx + nx * d, my + ny * d], P);
+        if (inside && sawAir) return true;
+        if (!inside) { sawAir = true; if (solidRun) break; } else solidRun = d;
+      }
+      return !sawAir ? true : solidRun >= 2.5 * delta;
+    };
+    tot += l;
+    if (hiddenBy(U) || hiddenBy(D)) hid += l;
   }
-  return { frame, r, out, len: b.max[2] - b.min[2] };
+  return tot ? hid / tot : 0;
 }
 
-function pinsFit(islands: CrossSection[]): number {
-  let glue = 0;
-  for (const isl of islands) if (isl.offset(-(JOINT.pinRSmall + JOINT.clearance + JOINT.wall), 'Round').isEmpty()) glue++;
-  return glue;
+/** Seam statistics of one planar section: seam length, hidden share, island structure, islands that cannot take any keyed joint. */
+function sectionStats(cs: CrossSection, h: number, upper?: CrossSection, lower?: CrossSection, delta?: number): Section & { islands: CrossSection[] } {
+  const islands = cs.decompose();
+  const areas = islands.map((i) => i.area());
+  const maxA = Math.max(...areas, 0);
+  let big = 0, small = 0, thin = 0;
+  islands.forEach((isl, k) => {
+    if (areas[k] >= maxA * 0.12) big++; else small++;
+    if (isl.offset(-(JOINT.minPinR + JOINT.clearance + JOINT.wall), 'Round').isEmpty()) thin++;
+  });
+  return { h, area: cs.area(), per: perimeter(cs), covered: upper && lower && delta ? coveredFraction(cs, upper, lower, delta) : 0, big, small, thin, islands };
+}
+
+/** Cost of the seam itself (lower = less visible, stronger joint). Pure 2D, cheap. */
+function seamCost(s: Section, prev: Section | undefined, next: Section | undefined, whole: number, n: number[]): number {
+  // Short seams hide better; a perimeter local minimum is a neck/waist/crease where the eye expects a line anyway.
+  const crease = prev && next && s.per <= prev.per && s.per <= next.per ? -10 - 20 * Math.max(0, 1 - s.per / ((prev.per + next.per) / 2)) : 0;
+  // Only the visible part of the seam counts fully; a seam tucked under a hem/collar is nearly free.
+  return 35 * (s.per / whole) * (1 - 0.85 * s.covered) - 15 * s.covered + crease
+    + 40 * s.small     // slicing through a thin limb/strand: extra visible ring, fragile unkeyed joint
+    + 12 * Math.max(0, s.big - 1)
+    + 50 * s.thin
+    + 6 * (1 - Math.abs(n[2]));
 }
 
 function findCut(m: Manifold, onProgress: (f: number) => void): Candidate | null {
   const total = m.volume();
-  let best: Candidate | null = null;
-  CUT_NORMALS.forEach((n, ni) => {
-    onProgress(ni / CUT_NORMALS.length);
-    const { frame, r, out, len } = sections(m, n, 24);
-    if (len <= 1) return;
-    const maxA = Math.max(...out.map((s) => s.area), 1e-9);
-    const whole = Math.max(...dims(m));
-    out.forEach((s, i) => {
-      if (s.area <= 0) return;
-      // Seam visibility proxy: relative cross-section (necks, waists, joints are local minima).
-      const rel = s.area / maxA;
-      const localMin = (out[i - 1]?.area ?? Infinity) >= s.area && (out[i + 1]?.area ?? Infinity) >= s.area;
-      const [above, below] = r.splitByPlane([0, 0, 1], s.h);
-      const va = above.volume(), vb = below.volume();
-      const unfit = (fitsSomehow(above) ? 0 : 1) + (fitsSomehow(below) ? 0 : 1);
-      const shrink = Math.max(...dims(above), ...dims(below)) / whole; // progress on the oversize problem
-      above.delete(); below.delete();
-      if (Math.min(va, vb) < total * 0.03) return; // no slivers
-      const islands = s.cs.decompose();
-      const glue = pinsFit(islands);
-      // Balanced pieces need fewer further cuts; tilted planes cost a little (harder to align visually).
-      const cost = rel * 100 + (localMin ? -15 : 0) + unfit * 150 + shrink * 120 + glue * 40 + islands.length * 5 + Math.abs(va - vb) / total * 20 + (n[0] && n[2] ? 8 : 0) + (n[2] === 1 ? 0 : 4);
-      if (!best || cost < best.cost) best = { normal: n, offset: s.h, cost, area: s.area, islands, frame };
-    });
+  const whole = Math.max(...dims(m));
+  // Search on a simplified proxy (fast); the final section is re-sliced on the real mesh.
+  const proxy = m.numTri() > 20000 ? m.simplify(whole * 0.0015) : m;
+  const SAMPLES = 48;
+  const DELTA = Math.min(3, whole / 80); // hem/collar overlap probe distance (mm)
+  type Scored = { n: number[]; h: number; seam: number; est: number; frame: Matrix4 };
+  const pool: Scored[] = [];
+  NORMALS.forEach((n, ni) => {
+    onProgress((ni / NORMALS.length) * 0.6);
+    const frame = rotTo(n, [0, 0, 1]);
+    const r = proxy.transform(mat(frame));
+    const b = r.boundingBox();
+    const len = b.max[2] - b.min[2];
+    if (len <= 1) { r.delete(); return; }
+    const secs: Section[] = [];
+    for (let i = 1; i < SAMPLES; i++) {
+      const h = b.min[2] + (len * i) / SAMPLES;
+      const cs = r.slice(h), up = r.slice(h + DELTA), dn = r.slice(h - DELTA);
+      const st = sectionStats(cs, h, up, dn, DELTA);
+      st.islands.forEach((x) => x.delete()); cs.delete(); up.delete(); dn.delete();
+      secs.push(st);
+    }
     r.delete();
+    // Cheap progress estimate: the longer half along the normal must shrink toward the bed size.
+    // Other extents stay roughly as they are, so a cut across the wrong axis earns nothing.
+    const ex = b.max[0] - b.min[0], ey = b.max[1] - b.min[1];
+    const cp = (...d: number[]) => d.reduce((a, x) => a * Math.max(1, Math.ceil((x - 0.5) / USABLE)), 1);
+    const progress1 = (h: number) => 120 * (cp(h - b.min[2], ex, ey) + cp(b.max[2] - h, ex, ey) - 1) * 0.5; // bbox-based, pessimistic: half weight
+    const scored = secs.map((s, i) => ({ n, h: s.h, frame, seam: s.area > 0 ? seamCost(s, secs[i - 1], secs[i + 1], whole, n) : Infinity, est: 0 }))
+      .filter((x) => Number.isFinite(x.seam));
+    scored.forEach((x) => (x.est = x.seam + progress1(x.h)));
+    scored.sort((a, b) => a.est - b.est);
+    // Best candidates of this direction go to the exact 3D evaluation, plus the best balanced ones (tips have short seams but make no progress).
+    const balanced = scored.filter((x) => Math.min(x.h - b.min[2], b.max[2] - x.h) > len * 0.25).slice(0, 4);
+    pool.push(...new Set([...scored.slice(0, 8), ...balanced]));
   });
-  return best;
-}
 
-// ---------- pins ----------
-function choosePins(islands: CrossSection[]): { p: Vec2; r: number; depth: number; shape: 'round' | 'square' }[] {
-  const pins: { p: Vec2; r: number; depth: number; shape: 'round' | 'square' }[] = [];
-  for (const isl of islands) {
-    for (const [r, depth] of [[JOINT.pinR, JOINT.depth], [JOINT.pinRSmall, JOINT.depthSmall]]) {
-      const inset = isl.offset(-(r + JOINT.clearance + JOINT.wall), 'Round');
-      if (inset.isEmpty()) continue;
-      const pts = inset.toPolygons().flat();
-      // Two pins as far apart as possible lock rotation; otherwise one square key.
-      let a = pts[0], b = pts[0], dmax = 0;
-      for (let i = 0; i < pts.length; i += Math.max(1, Math.floor(pts.length / 200)))
-        for (let j = i + 1; j < pts.length; j += Math.max(1, Math.floor(pts.length / 200))) {
-          const d = Math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1]);
-          if (d > dmax) { dmax = d; a = pts[i]; b = pts[j]; }
-        }
-      if (dmax > 2 * r + 4) {
-        // pull 25% toward each other to stay away from thin tips of the inset region
-        const lerp = (p: Vec2, q: Vec2, t: number): Vec2 => [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t];
-        pins.push({ p: lerp(a, b, 0.2), r, depth, shape: 'round' }, { p: lerp(b, a, 0.2), r, depth, shape: 'round' });
-      } else {
-        const bb = inset.bounds();
-        pins.push({ p: [(bb.min[0] + bb.max[0]) / 2, (bb.min[1] + bb.max[1]) / 2], r, depth, shape: 'square' });
-      }
-      break;
+  const full = (n: number[], h: number, frame: Matrix4, sliver = 0.03): number => {
+    const r = proxy.transform(mat(frame));
+    const [above, below] = r.splitByPlane([0, 0, 1], h);
+    const va = above.volume(), vb = below.volume();
+    // Expected final part count after this cut: slicing off thin slabs leaves the big problem untouched.
+    const parts = estParts(above) + estParts(below);
+    // A piece that cannot stand on its own seam must print with the seam (and its holes) sideways: worse fit, more support.
+    const notDown = (fitsSeamDown(above, [0, 0, -1]) ? 0 : 1) + (fitsSeamDown(below, [0, 0, 1]) ? 0 : 1);
+    const ta = above.boundingBox(), tb = below.boundingBox();
+    const slab = Math.min(ta.max[2] - h, h - tb.min[2]) < 25 ? 1 : 0; // thin washers: weak, extra seam for little gain
+    above.delete(); below.delete(); r.delete();
+    if (Math.min(va, vb) < total * sliver) return Infinity; // no slivers
+    return (parts - 1) * 120 + notDown * 60 + slab * 60 + 10 * Math.abs(va - vb) / total;
+  };
+  const seamAt = (n: number[], h: number, frame: Matrix4, step: number) => {
+    const r = proxy.transform(mat(frame));
+    const st = [h - step, h, h + step].map((x) => { const cs = r.slice(x), up = r.slice(x + DELTA), dn = r.slice(x - DELTA); const s = sectionStats(cs, x, up, dn, DELTA); s.islands.forEach((i) => i.delete()); [cs, up, dn].forEach((c) => c.delete()); return s; });
+    r.delete();
+    return st[1].area > 0 ? seamCost(st[1], st[0], st[2], whole, n) : Infinity;
+  };
+  pool.sort((a, b) => a.est - b.est);
+  const evalPool = (sliver: number) => pool.slice(0, 80).map((c, i) => { onProgress(0.6 + 0.25 * (i / 80)); return { ...c, cost: c.seam + full(c.n, c.h, c.frame, sliver) }; })
+    .filter((c) => Number.isFinite(c.cost)).sort((a, b) => a.cost - b.cost);
+  let ranked = evalPool(0.03);
+  if (!ranked.length) ranked = evalPool(0.005);
+  if (!ranked.length) { if (proxy !== m) proxy.delete(); return null; }
+  // Local refinement around the 3 best: tilt the plane ±8° and slide it ±1.5% of size.
+  const refined = [...ranked];
+  for (const c of ranked.slice(0, 3)) {
+    const t = new Vector3(...c.n);
+    const u = new Vector3().crossVectors(t, Math.abs(t.z) < 0.9 ? new Vector3(0, 0, 1) : new Vector3(1, 0, 0)).normalize();
+    const v = new Vector3().crossVectors(t, u);
+    for (const [du, dv, dh] of [[0, 0, -1], [0, 0, 1], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0]]) {
+      const n = t.clone().addScaledVector(u, du * 0.14).addScaledVector(v, dv * 0.14).normalize().toArray();
+      const frame = rotTo(n, [0, 0, 1]);
+      // re-express the plane offset in the new frame through the same anchor point
+      const anchor = new Vector3(0, 0, c.h).applyMatrix4(c.frame.clone().invert());
+      const h = anchor.dot(new Vector3(...n)) + dh * whole * 0.015;
+      const cost = seamAt(n, h, frame, whole / SAMPLES) + full(n, h, frame);
+      if (Number.isFinite(cost)) refined.push({ n, h, frame, seam: 0, est: 0, cost });
     }
   }
-  return pins;
+  onProgress(0.95);
+  ranked = refined.sort((a, b) => a.cost - b.cost);
+  const best = ranked[0];
+  if (proxy !== m) proxy.delete();
+  const r = m.transform(mat(best.frame));
+  const cs = r.slice(best.h), up = r.slice(best.h + DELTA), dn = r.slice(best.h - DELTA);
+  const st = sectionStats(cs, best.h, up, dn, DELTA);
+  r.delete(); up.delete(); dn.delete();
+  return { normal: best.n, offset: best.h, cost: best.cost, area: st.area, islands: st.islands, frame: best.frame, seamLength: st.per, hidden: st.covered };
 }
 
-function pinSolid(w: Wasm, shape: 'round' | 'square', r: number, len: number): Manifold {
-  return shape === 'round' ? w.Manifold.cylinder(len, r, r, 32, true) : w.Manifold.cube([r * 1.6, r * 1.6, len], true);
+// ---------- joints ----------
+type Pt = Vec2;
+const inPolys = (p: Pt, polys: Pt[][]) => {
+  let inside = false;
+  for (const poly of polys) for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a[1] > p[1]) !== (b[1] > p[1]) && p[0] < ((b[0] - a[0]) * (p[1] - a[1])) / (b[1] - a[1]) + a[0]) inside = !inside;
+  }
+  return inside;
+};
+const distToPolys = (p: Pt, polys: Pt[][]) => {
+  let d = Infinity;
+  for (const poly of polys) for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const abx = b[0] - a[0], aby = b[1] - a[1];
+    const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / (abx * abx + aby * aby || 1)));
+    d = Math.min(d, Math.hypot(p[0] - a[0] - t * abx, p[1] - a[1] - t * aby));
+  }
+  return d;
+};
+
+/** Largest inscribed circle radius of an island (binary search on inward offset). */
+function inscribedRadius(isl: CrossSection): number {
+  const b = isl.bounds();
+  let lo = 0, hi = Math.min(b.max[0] - b.min[0], b.max[1] - b.min[1]) / 2;
+  for (let i = 0; i < 12; i++) { const mid = (lo + hi) / 2; const o = isl.offset(-mid, 'Round'); if (o.isEmpty()) hi = mid; else lo = mid; o.delete(); }
+  return lo;
+}
+
+export interface PinPlan { p: Pt; r: number; depth: number; shape: 'round' | 'square' }
+
+/**
+ * Dowel layout for one section island: radius from the inscribed circle, 2–3 pins spread far apart (locks rotation),
+ * each hole depth shrunk until the hole is verified to stay inside material on both sides. A single surviving pin becomes a square key.
+ */
+export function planJoints(w: Wasm, isl: CrossSection, body: Manifold, inv: Matrix4, h: number): PinPlan[] {
+  const Rin = inscribedRadius(isl);
+  const maxR = Rin - JOINT.clearance - JOINT.wall - 0.2;
+  if (maxR < JOINT.minPinR) return [];
+  const r = Math.min(JOINT.maxPinR, Math.max(JOINT.minPinR, Math.round(Math.min(maxR, Rin * 0.3) * 2) / 2));
+  const inset = isl.offset(-(r + JOINT.clearance + JOINT.wall), 'Round');
+  const ipolys = inset.toPolygons() as Pt[][];
+  const polys = isl.toPolygons() as Pt[][];
+  const bb = inset.bounds();
+  const step = Math.max(r * 0.75, Math.sqrt(Math.max(inset.area(), 1)) / 14);
+  const cand: { p: Pt; edge: number }[] = [];
+  for (let x = bb.min[0]; x <= bb.max[0] + 1e-9; x += step) for (let y = bb.min[1]; y <= bb.max[1] + 1e-9; y += step) {
+    const p: Pt = [x, y];
+    if (inPolys(p, ipolys)) cand.push({ p, edge: distToPolys(p, polys) });
+  }
+  if (!cand.length) { const c: Pt = [(bb.min[0] + bb.max[0]) / 2, (bb.min[1] + bb.max[1]) / 2]; if (inPolys(c, ipolys)) cand.push({ p: c, edge: distToPolys(c, polys) }); }
+  inset.delete();
+  const want = isl.area() > 2500 && Rin > 12 ? 3 : 2;
+  const spacing = 2 * (r + JOINT.clearance) + 4;
+  const depth0 = Math.min(JOINT.maxDepth, Math.max(JOINT.minDepth, r * 3));
+  const tryHole = (p: Pt, shape: 'round' | 'square'): PinPlan | null => {
+    for (const f of [1, 0.8, 0.65, 0.5]) {
+      const depth = Math.max(JOINT.minDepth * 0.75, depth0 * f);
+      const hole = holeSolid(w, shape, r, depth).translate([p[0], p[1], h]).transform(mat(inv));
+      const inside = hole.intersect(body).volume() / hole.volume();
+      hole.delete();
+      if (inside > 0.995) return { p, r, depth, shape };
+    }
+    return null;
+  };
+  const chosen: PinPlan[] = [];
+  const pool = [...cand];
+  while (chosen.length < want && pool.length) {
+    // First pin at the deepest point; next ones maximise distance to chosen pins (rotation lock), with a preference for thick material.
+    pool.sort((a, b) => score(b) - score(a));
+    const c = pool.shift()!;
+    if (chosen.some((q) => Math.hypot(q.p[0] - c.p[0], q.p[1] - c.p[1]) < spacing)) continue;
+    const plan = tryHole(c.p, 'round');
+    if (plan) chosen.push(plan);
+  }
+  function score(c: { p: Pt; edge: number }) {
+    if (!chosen.length) return c.edge;
+    return Math.min(...chosen.map((q) => Math.hypot(q.p[0] - c.p[0], q.p[1] - c.p[1]))) + 0.5 * c.edge;
+  }
+  if (chosen.length === 1) { const key = tryHole(chosen[0].p, 'square'); if (key) chosen[0] = key; }
+  return chosen;
+}
+
+const CHAMFER = 0.5;
+/** Blind hole spanning both sides of the plane at z=0, with a 45° mouth chamfer (absorbs elephant foot, guides the pin). */
+function holeSolid(w: Wasm, shape: 'round' | 'square', r: number, depth: number): Manifold {
+  const R = r + JOINT.clearance, len = 2 * (depth + JOINT.endGap / 2);
+  if (shape === 'square') return w.Manifold.cube([2 * R * 0.8 + 2 * JOINT.clearance * 0.2, 2 * R * 0.8 + 2 * JOINT.clearance * 0.2, len], true);
+  const body = w.Manifold.cylinder(len, R, R, 48, true);
+  const up = w.Manifold.cylinder(CHAMFER, R + CHAMFER, R, 48, false);
+  const down = w.Manifold.cylinder(CHAMFER, R, R + CHAMFER, 48, false).translate([0, 0, -CHAMFER]);
+  return w.Manifold.union([body, up, down]);
+}
+/** Dowel in local frame (axis = z). Round dowels get chamfered ends and a flat on -y so they print lying down: layers along the axis, no shear failure at the seam. */
+function dowelSolid(w: Wasm, shape: 'round' | 'square', r: number, depth: number): Manifold {
+  const len = 2 * depth - JOINT.endGap;
+  if (shape === 'square') return w.Manifold.cube([2 * r * 0.8, 2 * r * 0.8, len], true);
+  const c = Math.min(0.5, r * 0.25);
+  const core = w.Manifold.hull([w.Manifold.cylinder(len - 2 * c, r, r, 48, true), w.Manifold.cylinder(len, r - c, r - c, 48, true)]);
+  const flat = r * 0.15;
+  return core.trimByPlane([0, 1, 0], -(r - flat));
 }
 
 // ---------- main ----------
@@ -192,10 +416,14 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
   solid = solid.translate([-(b0.min[0] + b0.max[0]) / 2, -(b0.min[1] + b0.max[1]) / 2, -b0.min[2]]);
   const vol0 = solid.volume();
 
-  interface Work { m: Manifold; faces: { normal: number[]; offset: number }[]; cutIds: number[] }
-  let work: Work[] = [{ m: solid, faces: [], cutIds: [] }];
+  interface Work { m: Manifold; faces: { normal: number[]; offset: number }[]; cutIds: number[]; node: number }
+  let work: Work[] = [{ m: solid, faces: [], cutIds: [], node: 0 }];
+  // Cut tree: every cut splits one node into child nodes; reversing it gives a sequence of joins between rigid sub-assemblies.
+  const children = new Map<number, number[]>();
+  const tree: { cut: number; n: number[]; above: number[]; below: number[] }[] = [];
+  let nodeSeq = 0;
   const cuts: Cut[] = [];
-  const pinParts: { m: Manifold; cut: number }[] = [];
+  const pinParts: { m: Manifold; cut: number; toWorld: Matrix4; shape: 'round' | 'square' }[] = [];
   let removedHoleVol = 0;
   let decision = fitsSomehow(solid) ? 'Model fits the A1 Mini build volume in one piece: printed whole (no seams).' : '';
 
@@ -206,39 +434,45 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
     if (work.length >= maxParts) { warnings.push(`Part limit (${maxParts}) reached; some parts may not fit.`); break; }
     const it = work[idx];
     progress(`Searching cut ${cuts.length + 1}`, 0.1 + 0.5 * (cuts.length / maxParts));
-    const c = findCut(it.m, () => {});
+    const c = findCut(it.m, (f) => progress(`Searching cut ${cuts.length + 1}`, 0.1 + 0.5 * ((cuts.length + f) / maxParts)));
     if (!c) { warnings.push('No valid cut found for an oversized part.'); break; }
     const inv = c.frame.clone().invert();
     const n = new Vector3(...c.normal).normalize().toArray();
-    // Pins: blind holes on both sides of the plane, separate dowel parts. Every hole is verified to stay inside material.
-    const pins = choosePins(c.islands);
+    // Joints: blind holes across the plane + separate dowels. Each hole is verified inside material before it is cut.
     const infos: PinInfo[] = [];
-    let holes: Manifold | null = null;
-    for (const p of pins) {
-      const holeLen = 2 * (p.depth + JOINT.endGap / 2);
-      const hole = pinSolid(w, p.shape, p.r + JOINT.clearance, holeLen).translate([p.p[0], p.p[1], c.offset]).transform(mat(inv));
-      const inside = hole.intersect(it.m).volume() / hole.volume();
-      const verified = inside > 0.995;
-      const center = new Vector3(p.p[0], p.p[1], c.offset).applyMatrix4(inv).toArray();
-      infos.push({ center, axis: n, r: p.r, depth: p.depth, shape: p.shape, verified });
-      if (!verified) { warnings.push(`Cut ${cuts.length + 1}: a pin hole would break through the surface (${(inside * 100).toFixed(1)}% inside); pin dropped.`); continue; }
-      holes = holes ? holes.add(hole) : hole;
-      pinParts.push({ m: pinSolid(w, p.shape, p.r, 2 * p.depth - JOINT.endGap).translate([p.p[0], p.p[1], c.offset]).transform(mat(inv)), cut: cuts.length + 1 });
+    const holeList: Manifold[] = [];
+    let glue = 0;
+    for (const isl of c.islands) {
+      const plans = planJoints(w, isl, it.m, inv, c.offset);
+      if (!plans.length) glue++;
+      if (plans.length === 1 && plans[0].shape === 'round') warnings.push(`Cut ${cuts.length + 1}: one island holds a single round pin (no room for a key); it can rotate — align by eye.`);
+      for (const p of plans) {
+        const local = new Matrix4().makeTranslation(p.p[0], p.p[1], c.offset);
+        const toWorld = inv.clone().multiply(local);
+        holeList.push(holeSolid(w, p.shape, p.r, p.depth).transform(mat(toWorld)));
+        infos.push({ center: new Vector3().applyMatrix4(toWorld).toArray(), axis: n, r: p.r, depth: p.depth, shape: p.shape, verified: true });
+        pinParts.push({ m: dowelSolid(w, p.shape, p.r, p.depth).transform(mat(toWorld)), cut: cuts.length + 1, toWorld, shape: p.shape });
+      }
     }
-    const glue = pinsFit(c.islands);
-    if (glue) warnings.push(`Cut ${cuts.length + 1}: ${glue} section island(s) too thin for a pin — glue-only, alignment not keyed.`);
+    const holes = holeList.length ? w.Manifold.union(holeList) : null;
+    if (glue) warnings.push(`Cut ${cuts.length + 1}: ${glue} section island(s) too thin for any dowel — glue-only, alignment not keyed.`);
     const offsetWorld = c.offset; // frame maps n -> z, so plane offset along n is unchanged
     let body = it.m;
     if (holes) { removedHoleVol += holes.intersect(body).volume(); body = body.subtract(holes); }
     const [above, below] = body.splitByPlane(n, offsetWorld);
-    const cut: Cut = { id: cuts.length + 1, normal: n, offset: offsetWorld, pins: infos, area: c.area, islands: c.islands.length, glueOnlyIslands: glue };
+    const cut: Cut = { id: cuts.length + 1, normal: n, offset: offsetWorld, pins: infos, area: c.area, islands: c.islands.length, glueOnlyIslands: glue, seamLength: c.seamLength, hidden: c.hidden };
     cuts.push(cut);
     const next: Work[] = [];
+    const sideA: number[] = [], sideB: number[] = [];
     for (const [side, sgn] of [[above, -1], [below, 1]] as const)
       for (const piece of side.decompose()) {
         if (piece.volume() < 1) { warnings.push('Dropped a sub-1 mm³ fragment produced by a cut.'); continue; }
-        next.push({ m: piece, faces: [...it.faces, { normal: n.map((x) => x * sgn), offset: offsetWorld * sgn }], cutIds: [...it.cutIds, cut.id] });
+        const node = ++nodeSeq;
+        (sgn < 0 ? sideA : sideB).push(node);
+        next.push({ m: piece, faces: [...it.faces, { normal: n.map((x) => x * sgn), offset: offsetWorld * sgn }], cutIds: [...it.cutIds, cut.id], node });
       }
+    children.set(it.node, [...sideA, ...sideB]);
+    tree.push({ cut: cut.id, n, above: sideA, below: sideB });
     work.splice(idx, 1, ...next);
   }
   if (!decision) decision = `Model exceeds ${USABLE} mm usable volume: ${cuts.length} cut(s) → ${work.length} printed body parts + ${pinParts.length} dowel pins.`;
@@ -264,47 +498,36 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
   const allPins = cuts.flatMap((c) => c.pins);
   checks['Pin holes fully inside material'] = allPins.length ? `${allPins.filter((p) => p.verified).length}/${allPins.length} verified` : 'n/a (no pins)';
 
-  // ---- assembly order: BFS over shared cut faces from the largest part; each insertion is a straight move along the cut normal. ----
+  // ---- assembly order: reverse the cut tree. Each step joins two rigid sub-assemblies separated by one plane,
+  // moving one along that plane's normal; dowel axes are parallel to that move. Verified with a sampled sweep anyway. ----
   progress('Checking assembly sequence', 0.72);
   const assemblyOrder: PrepareResult['assemblyOrder'] = [];
-  if (bodies.length > 1) {
-    const done = new Set<number>();
-    const start = bodies.reduce((a, b) => (a.volume > b.volume ? a : b));
-    done.add(start.id);
-    assemblyOrder.push({ part: start.id, onto: null, dir: null, ok: null });
-    let assembled = start.solid;
-    let progressMade = true;
-    while (done.size < bodies.length && progressMade) {
-      progressMade = false;
-      for (const p of bodies) {
-        if (done.has(p.id)) continue;
-        // a face of p whose opposite plane belongs to an assembled part = neighbor along that cut
-        const f = p.cutFaces.find((f) => bodies.some((q) => done.has(q.id) && q.cutFaces.some((g) => Math.abs(g.offset + f.offset) < 1e-6 && g.normal.every((v, k) => Math.abs(v + f.normal[k]) < 1e-9)) && p.solid.minGap(q.solid, 0.5) < 0.5));
-        if (!f) continue;
-        const onto = bodies.find((q) => done.has(q.id) && p.solid.minGap(q.solid, 0.5) < 0.5)!;
-        // Insert along the face normal (toward the neighbour): start displaced back by pin depth + 1 mm and sweep in; any collision with assembled parts = blocked.
-        const travel = JOINT.depth + 1;
-        let ok = true;
-        for (const t of [travel, travel * 0.66, travel * 0.33, 0.05]) {
-          const moved = p.solid.translate(f.normal.map((v) => -v * t) as [number, number, number]);
-          if (moved.intersect(assembled).volume() > 1e-3) { ok = false; break; }
-        }
-        p.insertDir = f.normal; p.parent = onto.id; p.blocked = !ok;
-        assemblyOrder.push({ part: p.id, onto: onto.id, dir: p.insertDir, ok });
-        if (!ok) warnings.push(`${p.name}: straight insertion along its cut normal collides with already assembled parts.`);
-        done.add(p.id);
-        assembled = assembled.add(p.solid);
-        progressMade = true;
-      }
+  const partOfNode = new Map(work.map((x, i) => [x.node, i + 1]));
+  const leaves = (node: number): number[] => (partOfNode.has(node) ? [partOfNode.get(node)!] : (children.get(node) ?? []).flatMap(leaves));
+  for (const t of [...tree].reverse()) {
+    const a = t.above.flatMap(leaves), b = t.below.flatMap(leaves);
+    const solidOf = (ids: number[]) => w.Manifold.union(ids.map((id) => parts[id - 1].solid));
+    const A = solidOf(a), B = solidOf(b);
+    const travel = JOINT.maxDepth + 1;
+    let ok = true;
+    for (let k = 8; k >= 1 && ok; k--) {
+      const moved = A.translate(t.n.map((v) => (v * travel * k) / 8) as [number, number, number]);
+      if (moved.intersect(B).volume() > 1e-3) ok = false;
+      moved.delete();
     }
-    checks['Assembly sequence (straight-line insertion, sampled sweep)'] = assemblyOrder.every((a) => a.ok !== false) && done.size === bodies.length ? 'PASS' : 'FAIL';
+    A.delete(); B.delete();
+    const pins = parts.filter((p) => p.role === 'pin' && p.name.endsWith(`_cut${t.cut}`)).map((p) => p.id);
+    assemblyOrder.push({ cut: t.cut, dir: t.n.map((v) => -v), a, b, pins, ok });
+    if (!ok) warnings.push(`Cut ${t.cut}: joining its two sides along the cut normal collides (should not happen for planar cuts; check the model).`);
   }
+  if (assemblyOrder.length) checks['Assembly sequence (hierarchical joins along cut normals, sampled sweep)'] = assemblyOrder.every((x) => x.ok) ? 'PASS' : 'FAIL';
 
   // ---- orientation ----
   parts.forEach((p, i) => {
     progress(`Orienting ${p.name}`, 0.75 + 0.15 * (i / parts.length));
-    if (p.role === 'pin') { // dowels print standing: round holes stay round, no supports
-      p.orient = rotTo(allPinsAxis(cuts, p), [0, 0, 1]);
+    if (p.role === 'pin') { // dowels print lying on their flat: axis along layers, so they do not snap at the seam
+      const pp = pinParts[+/^pin_(\d+)/.exec(p.name)![1] - 1];
+      p.orient = (pp.shape === 'round' ? new Matrix4().makeRotationX(Math.PI / 2) : new Matrix4()).multiply(pp.toWorld.clone().invert());
     } else {
       const o = bestOrientation(p.solid, p.cutFaces);
       p.orient = o.rot;
@@ -325,7 +548,7 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
     if (it.w > USABLE + gap && it.h <= USABLE + gap) rot = true;
     const W = rot ? it.h : it.w, H = rot ? it.w : it.h;
     if (x + W > USABLE + gap) { x = 0; y += rowH; rowH = 0; }
-    if (y + H > USABLE + gap) { plate++; x = 0; y = 0; rowH = 0; }
+    if (y + H > USABLE + gap && y > 0) { plate++; x = 0; y = 0; rowH = 0; } // never leave a plate empty
     const off = (A1_MINI.x - USABLE) / 2;
     if (rot) {
       it.p.orient = new Matrix4().makeRotationZ(Math.PI / 2).multiply(it.p.orient);
@@ -338,13 +561,9 @@ export function prepare(w: Wasm, input: Manifold, scale: number, maxParts: numbe
   }
   const outside = parts.filter((p) => { const b = p.placed!.boundingBox(); return b.min[0] < -1e-6 || b.min[1] < -1e-6 || b.max[0] > A1_MINI.x || b.max[1] > A1_MINI.y || b.max[2] > A1_MINI.z; });
   checks['Every part inside 180×180×180 after orientation'] = outside.length ? `FAIL (${outside.map((p) => p.name).join(', ')})` : 'PASS';
-  if (cuts.length) warnings.push('Joint clearances are generic defaults (0.15 mm radial). Print one test joint before the full job.');
+  if (cuts.length) warnings.push('Joint clearances are generic defaults (0.2 mm radial, 0.5 mm mouth chamfer). Print one test joint before the full job.');
   warnings.push('Cut placement uses geometric cues (narrow sections, low support). It has no semantic knowledge of faces, clothing or hair: review seams in Exploded view.');
   progress('Done', 1);
   return { scale, parts, cuts, plates: plate + 1, decision, warnings, checks, assemblyOrder };
 }
 
-function allPinsAxis(cuts: Cut[], p: PartOut): number[] {
-  const m = /cut(\d+)/.exec(p.name);
-  return cuts.find((c) => c.id === +(m?.[1] ?? 0))?.normal ?? [0, 0, 1];
-}
