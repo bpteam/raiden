@@ -39,15 +39,17 @@ addEventListener('resize', resize); resize();
 renderer?.setAnimationLoop(() => { controls.update(); renderer!.render(scene, camera); });
 
 /** Mesh with seam (cut-plane) triangles tinted, so every joint surface is visible at a glance. */
-function meshOf(soup: Float32Array, color: number, seams: { normal: number[]; offset: number }[] = []) {
+/** supportRisk (optional, per triangle): 1 = needs support on a visible surface (red), 2 = needs support, hidden surface (amber). */
+function meshOf(soup: Float32Array, color: number, seams: { normal: number[]; offset: number }[] = [], supportRisk?: Uint8Array) {
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(soup, 3));
   g.computeVertexNormals();
-  const base = new THREE.Color(color), seam = new THREE.Color(0xff3b5c);
+  const base = new THREE.Color(color), seam = new THREE.Color(0xff3b5c), riskVis = new THREE.Color(0xff2020), riskHid = new THREE.Color(0xffb020);
   const col = new Float32Array(soup.length);
   for (let t = 0; t < soup.length; t += 9) {
     const on = seams.some((f) => [0, 3, 6].every((o) => Math.abs(soup[t + o] * f.normal[0] + soup[t + o + 1] * f.normal[1] + soup[t + o + 2] * f.normal[2] - f.offset) < 0.05));
-    const c = on ? seam : base;
+    const risk = supportRisk?.[t / 9];
+    const c = on ? seam : risk === 1 ? riskVis : risk === 2 ? riskHid : base;
     for (let k = 0; k < 9; k += 3) { col[t + k] = c.r; col[t + k + 1] = c.g; col[t + k + 2] = c.b; }
   }
   g.setAttribute('color', new THREE.BufferAttribute(col, 3));
@@ -94,11 +96,11 @@ function draw(refit = false) {
       const n = result.meta.plates;
       for (let i = 0; i < n; i++) {
         const plate = new THREE.Group();
-        plate.position.set(i * 200, 0, 0);
+        plate.position.set((i % 3) * 200, -Math.floor(i / 3) * 200, 0);
         const bed = new THREE.Mesh(new THREE.PlaneGeometry(180, 180), new THREE.MeshStandardMaterial({ color: 0x2a2f38 }));
         bed.position.set(90, 90, -0.05); plate.add(bed);
         plate.add(new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(180, 180, 180)), new THREE.LineBasicMaterial({ color: 0x3a4250 })).translateX(90).translateY(90).translateZ(90));
-        result.parts.forEach((p: any, j: number) => { if (p.plate === i) plate.add(meshOf(p.placed, colorOf(p, j))); });
+        result.parts.forEach((p: any, j: number) => { if (p.plate === i) plate.add(meshOf(p.placed, colorOf(p, j), [], p.supportTris)); });
         root.add(plate);
       }
     } else {
@@ -209,13 +211,14 @@ $('go').onclick = () => {
     const names = (ids: number[]) => ids.map((id) => d.parts.find((p: any) => p.id === id).name).join(' + ');
     const cls = (v: string) => (v.startsWith('PASS') ? 'pass' : v.startsWith('FAIL') ? 'fail' : '');
     $('out').innerHTML += `<section><b>Result</b><p>${esc(m.decision)}</p>
-      <a download="${base}_a1mini.zip" href="${url}">⬇ Download ZIP (${d.files.length} files: STL per part + 3MF per plate)</a></section>
-      ${m.cuts.length ? `<section><b>Seams</b><ul>${m.cuts.map((c: any) => `<li>Cut ${c.id}: seam ${c.seamLength.toFixed(0)} mm, ${(c.hidden * 100).toFixed(0)}% under overlapping geometry · ${c.pins.length ? c.pins.map((p: any) => `${p.shape} ⌀${(2 * p.r).toFixed(1)}×${(2 * p.depth).toFixed(0)} mm`).join(', ') : '<span class="warn">no dowel</span>'}</li>`).join('')}</ul></section>` : ''}
+      <a download="${base}_a1mini.zip" href="${url}">⬇ Download ZIP (${d.files.length} files: Bambu Studio project 3MF with all plates, 3MF per plate, STL per part)</a></section>
+      <section><b>Estimates (geometric, not slicer output)</b><ul>${Object.entries(m.summary).map(([k, v]: any) => `<li><span class="k">${esc(k)}:</span> ${esc(String(v))}</li>`).join('')}</ul></section>
+      ${m.cuts.length ? `<section><b>Seams</b><ul>${m.cuts.map((c: any) => `<li>Cut ${c.id}: seam ${c.seamLength.toFixed(0)} mm, visibility-weighted ${c.visibleSeam.toFixed(0)} mm${c.neck > 0.2 ? ' · at a neck/crease' : ''}${c.curved ? ` · curved into a fold (±${c.curved.maxDz} mm, ${(c.curved.gain * 100).toFixed(0)}% less visible)` : ''} · ${c.pins.length ? c.pins.map((p: any) => `${p.shape} ⌀${(2 * p.r).toFixed(1)}×${(2 * p.depth).toFixed(0)} mm`).join(', ') : '<span class="warn">no dowel</span>'}</li>`).join('')}</ul></section>` : ''}
       <section><b>Verification</b><ul>${Object.entries(m.checks).map(([k, v]: any) => `<li><span class="k">${esc(k)}:</span> <span class="${cls(v)}">${esc(v)}</span></li>`).join('')}</ul></section>
-      <section><b>Parts</b><ul>${d.parts.map((p: any, j: number) => `<li><span class="sw" style="background:#${colorOf(p, j).toString(16).padStart(6, '0')}"></span>${p.name} · plate ${p.plate + 1}${p.role === 'body' ? ` · h ${p.height.toFixed(0)} mm · support ≈ ${(p.supportArea / 100).toFixed(1)} cm²` : ''}</li>`).join('')}</ul></section>
+      <section><b>Parts</b><ul>${d.parts.map((p: any, j: number) => `<li><span class="sw" style="background:#${colorOf(p, j).toString(16).padStart(6, '0')}"></span>${p.name} · plate ${p.plate + 1}${p.role === 'body' ? ` · h ${p.height.toFixed(0)} mm · support ≈ ${(p.supportArea / 100).toFixed(1)} cm² (${(p.supportVisible / 100).toFixed(1)} on visible surfaces)` : ''}</li>`).join('')}</ul></section>
       ${m.assemblyOrder.length ? `<section><b>Assembly sequence</b><ol>${m.assemblyOrder.map((a: any) => `<li>Seat ${a.pins.length} dowel(s) of cut ${a.cut} in ${names(a.b)}, then slide ${names(a.a)} onto them${a.ok ? '' : ' <span class="fail">collides</span>'}</li>`).join('')}</ol><div class="k">Each step joins two rigid groups across one flat seam; white arrows in Exploded view show the move. Dry-fit before glue.</div></section>` : ''}
       <section><b>Warnings / not verified</b><ul>${m.warnings.map((w: string) => `<li class="warn">${esc(w)}</li>`).join('')}
-      <li class="k">Not verified: print strength, actual fit tolerance, seam visibility to a human eye, slicer support placement.</li></ul></section>`;
+      <li class="k">Not verified: print strength, actual fit tolerance, seam visibility to a human eye. Support numbers are mesh estimates; slice in Bambu Studio for real support.</li></ul></section>`;
     draw(true);
   });
 };

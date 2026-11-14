@@ -29,12 +29,12 @@ self.onmessage = async (e: MessageEvent) => {
     const zip = zipSync({ ...files, 'README.txt': new TextEncoder().encode(readme(r)) });
     const parts = r.parts.map((p) => ({
       id: p.id, name: p.name, role: p.role, plate: p.plate, volume: p.volume, height: p.height, supportArea: p.supportArea, bedContact: p.bedContact,
-      cutFaces: p.cutFaces,
+      cutFaces: p.cutFaces, supportVisible: p.metrics?.supportVisible ?? 0, supportTris: p.supportTris,
       assembled: meshToSoup(p.solid), placed: meshToSoup(p.placed!),
     }));
     post({
       type: 'result', report, parts, zip, files: Object.keys(files),
-      meta: { scale: r.scale, decision: r.decision, checks: r.checks, warnings: r.warnings, cuts: r.cuts, plates: r.plates, assemblyOrder: r.assemblyOrder },
+      meta: { scale: r.scale, decision: r.decision, checks: r.checks, warnings: r.warnings, cuts: r.cuts, plates: r.plates, assemblyOrder: r.assemblyOrder, summary: r.summary },
     }, [zip.buffer, ...parts.flatMap((p) => [p.assembled.buffer, p.placed.buffer])]);
   } catch (err) {
     post({ type: 'error', message: err instanceof Error ? err.message : String(err) });
@@ -45,7 +45,8 @@ function readme(r: ReturnType<typeof prepare>): string {
   return [
     'Auto Splitter output — Bambu Lab A1 Mini (180×180×180 mm, 0.4 mm nozzle)', '',
     r.decision, '',
-    'Files: part_*.stl (oriented, placed in plate coordinates), pin_*.stl (dowels), plate_N.3mf (one per build plate).', '',
+    'Files: project.3mf (Bambu Studio project: every part on its plate, A1 Mini selected), plate_N.3mf (generic 3MF per plate), part_*.stl / pin_*.stl (oriented, plate coordinates).', '',
+    'Estimates (geometric, from the mesh; slice in Bambu Studio for real support/time):', ...Object.entries(r.summary).map(([k, v]) => `  ${k}: ${v}`), '',
     'Checks:', ...Object.entries(r.checks).map(([k, v]) => `  ${k}: ${v}`), '',
     'Assembly (each step joins two rigid groups across one flat seam; seat that cut\'s dowels in the second group first):',
     ...r.assemblyOrder.map((a, i) => `  ${i + 1}. cut ${a.cut}: dowels ${a.pins.map((id) => r.parts[id - 1].name).join(', ') || 'none'} into ${a.b.map((id) => r.parts[id - 1].name).join(' + ')}; slide ${a.a.map((id) => r.parts[id - 1].name).join(' + ')} on along (${a.dir.map((v) => v.toFixed(2)).join(', ')})${a.ok ? '' : ' (COLLIDES in sweep check)'}`),

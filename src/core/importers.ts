@@ -71,20 +71,24 @@ export function importSTL(buf: ArrayBuffer): TriSoup {
 
 function import3MF(buf: ArrayBuffer): TriSoup {
   const files = unzipSync(new Uint8Array(buf));
-  const key = Object.keys(files).find((k) => /\.model$/i.test(k));
-  if (!key) throw new Error('3MF: no .model part');
-  const xml = strFromU8(files[key]);
-  const unit = { micron: 0.001, millimeter: 1, centimeter: 10, inch: 25.4, foot: 304.8, meter: 1000 }[/unit="(\w+)"/.exec(xml)?.[1] ?? 'millimeter'] ?? 1;
-  // Objects by id -> triangle soup; then instantiate build items with transforms.
+  const models = Object.keys(files).filter((k) => /\.model$/i.test(k));
+  const main = models.find((k) => /^3D\/3dmodel\.model$/i.test(k)) ?? models[0];
+  if (!main) throw new Error('3MF: no .model part');
+  const mainXml = strFromU8(files[main]);
+  const unit = { micron: 0.001, millimeter: 1, centimeter: 10, inch: 25.4, foot: 304.8, meter: 1000 }[/unit="(\w+)"/.exec(mainXml)?.[1] ?? 'millimeter'] ?? 1;
+  // Objects keyed by "<model path>#<id>" so production-extension components (p:path="/3D/Objects/x.model") resolve.
   const objs = new Map<string, number[]>();
   const comps = new Map<string, { id: string; t: number[] }[]>();
-  for (const om of xml.matchAll(/<object\b[^>]*\bid="(\d+)"[^>]*>([\s\S]*?)<\/object>/g)) {
-    const body = om[2];
-    const vs = [...body.matchAll(/<vertex\b[^>]*x="([^"]+)"[^>]*y="([^"]+)"[^>]*z="([^"]+)"/g)].map((m) => [+m[1], +m[2], +m[3]]);
-    const tri: number[] = [];
-    for (const t of body.matchAll(/<triangle\b[^>]*v1="(\d+)"[^>]*v2="(\d+)"[^>]*v3="(\d+)"/g)) for (const k of [1, 2, 3]) tri.push(...vs[+t[k]]);
-    objs.set(om[1], tri);
-    comps.set(om[1], [...body.matchAll(/<component\b([^>]*)\/?>/g)].map((c) => ({ id: /objectid="(\d+)"/.exec(c[1])![1], t: parseT(/transform="([^"]+)"/.exec(c[1])?.[1]) })));
+  for (const path of models) {
+    const xml = strFromU8(files[path]);
+    for (const om of xml.matchAll(/<object\b[^>]*\bid="(\d+)"[^>]*>([\s\S]*?)<\/object>/g)) {
+      const body = om[2], k = `/${path}#${om[1]}`;
+      const vs = [...body.matchAll(/<vertex\b[^>]*x="([^"]+)"[^>]*y="([^"]+)"[^>]*z="([^"]+)"/g)].map((m) => [+m[1], +m[2], +m[3]]);
+      const tri: number[] = [];
+      for (const t of body.matchAll(/<triangle\b[^>]*v1="(\d+)"[^>]*v2="(\d+)"[^>]*v3="(\d+)"/g)) for (const q of [1, 2, 3]) tri.push(...vs[+t[q]]);
+      objs.set(k, tri);
+      comps.set(k, [...body.matchAll(/<component\b([^>]*)\/?>/g)].map((c) => ({ id: `${/p:path="([^"]+)"/.exec(c[1])?.[1] ?? `/${path}`}#${/objectid="(\d+)"/.exec(c[1])![1]}`, t: parseT(/transform="([^"]+)"/.exec(c[1])?.[1]) })));
+    }
   }
   const expand = (id: string, t: number[], out: number[], depth = 0) => {
     if (depth > 16) throw new Error('3MF: component recursion');
@@ -93,8 +97,8 @@ function import3MF(buf: ArrayBuffer): TriSoup {
     for (const c of comps.get(id) ?? []) expand(c.id, mul(t, c.t), out, depth + 1);
   };
   const out: number[] = [];
-  const build = /<build\b[^>]*>([\s\S]*?)<\/build>/.exec(xml)?.[1] ?? '';
-  for (const it of build.matchAll(/<item\b([^>]*)\/?>/g)) expand(/objectid="(\d+)"/.exec(it[1])![1], parseT(/transform="([^"]+)"/.exec(it[1])?.[1]), out);
+  const build = /<build\b[^>]*>([\s\S]*?)<\/build>/.exec(mainXml)?.[1] ?? '';
+  for (const it of build.matchAll(/<item\b([^>]*)\/?>/g)) expand(`/${main}#${/objectid="(\d+)"/.exec(it[1])![1]}`, parseT(/transform="([^"]+)"/.exec(it[1])?.[1]), out);
   return { pos: new Float32Array(out.map((x) => x * unit)), warnings: [] };
 }
 // 3MF transform: 12 numbers m00 m01 m02 m10 m11 m12 m20 m21 m22 m30 m31 m32 (row vectors)
